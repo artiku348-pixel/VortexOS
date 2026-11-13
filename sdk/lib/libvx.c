@@ -1,12 +1,13 @@
 /* libvx: program entry point and a minimal C library for VortexOS apps. */
 #include <vortex.h>
 
-/* The kernel calls _start(argc, argv) as a normal C function. Programs may
- * define main as `int main(void)` or `int main(int argc, char **argv)`. */
+/* The kernel enters _start as if it were called as a normal C function:
+ * argc in rdi, argv in rsi, aligned stack. Programs may define main as
+ * `int main(void)` or `int main(int argc, char **argv)`. */
 int main(int argc, char **argv);
-int _start(int argc, char **argv)
+int _start(long argc, char **argv)
 {
-    vx_exit(main(argc, argv));
+    vx_exit(main((int)argc, argv));
     return 0;
 }
 
@@ -111,12 +112,12 @@ static void emit(struct out *o, char c)
     o->n++;
 }
 
-static void emit_num(struct out *o, unsigned v, unsigned base, int width, char padc, int neg, int left)
+static void emit_num(struct out *o, unsigned long v, unsigned base, int width, char padc, int neg, int left)
 {
-    char tmp[12];
+    char tmp[24];
     int n = 0;
     do {
-        unsigned d = v % base;
+        unsigned d = (unsigned)(v % base);
         tmp[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
         v /= base;
     } while (v);
@@ -128,7 +129,8 @@ static void emit_num(struct out *o, unsigned v, unsigned base, int width, char p
     if (left) for (; width > len; width--) emit(o, ' ');
 }
 
-/* Supports %c %s %d %i %u %x %p %% with flags '-' and '0' and a width. */
+/* Supports %c %s %d %i %u %x %p %% with flags '-' and '0', a width and the
+ * size modifiers l and z (64-bit values). */
 int vsnprintf(char *buf, size_t max, const char *fmt, va_list ap)
 {
     struct out o = { buf, max, 0 };
@@ -143,7 +145,8 @@ int vsnprintf(char *buf, size_t max, const char *fmt, va_list ap)
             else break;
         }
         while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
-        if (*fmt == 'l') fmt++;
+        int wide = 0;
+        while (*fmt == 'l' || *fmt == 'z') { wide = 1; fmt++; }
         switch (*fmt) {
         case 'c': emit(&o, (char)va_arg(ap, int)); break;
         case 's': {
@@ -156,13 +159,13 @@ int vsnprintf(char *buf, size_t max, const char *fmt, va_list ap)
             break;
         }
         case 'd': case 'i': {
-            int v = va_arg(ap, int);
-            emit_num(&o, v < 0 ? 0u - (unsigned)v : (unsigned)v, 10, width, padc, v < 0, left);
+            long v = wide ? va_arg(ap, long) : va_arg(ap, int);
+            emit_num(&o, v < 0 ? 0ul - (unsigned long)v : (unsigned long)v, 10, width, padc, v < 0, left);
             break;
         }
-        case 'u': emit_num(&o, va_arg(ap, unsigned), 10, width, padc, 0, left); break;
-        case 'x': emit_num(&o, va_arg(ap, unsigned), 16, width, padc, 0, left); break;
-        case 'p': emit(&o, '0'); emit(&o, 'x'); emit_num(&o, va_arg(ap, unsigned), 16, 8, '0', 0, 0); break;
+        case 'u': emit_num(&o, wide ? va_arg(ap, unsigned long) : va_arg(ap, unsigned), 10, width, padc, 0, left); break;
+        case 'x': emit_num(&o, wide ? va_arg(ap, unsigned long) : va_arg(ap, unsigned), 16, width, padc, 0, left); break;
+        case 'p': emit(&o, '0'); emit(&o, 'x'); emit_num(&o, va_arg(ap, unsigned long), 16, 16, '0', 0, 0); break;
         case '%': emit(&o, '%'); break;
         case '\0': fmt--; break;
         default: emit(&o, '%'); emit(&o, *fmt);

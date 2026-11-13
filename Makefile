@@ -2,11 +2,12 @@
 # MSYS): besides make it needs only the compiler and Python, all file
 # operations go through tools/build.py.
 #
-#   Linux:    the host gcc in 32-bit freestanding mode (package gcc-multilib)
-#   Windows:  the i686-elf-gcc cross compiler (MinGW gcc cannot produce ELF)
-#   macOS:    make CROSS=i686-elf-
+# VortexOS is a 64-bit (x86-64) system.
+#   Linux:    the host gcc on an x86-64 machine, in freestanding mode
+#   Windows:  the x86_64-elf-gcc cross compiler (MinGW gcc cannot produce ELF)
+#   macOS:    make CROSS=x86_64-elf-
 ifeq ($(OS),Windows_NT)
-CROSS   ?= i686-elf-
+CROSS   ?= x86_64-elf-
 PYTHON  ?= python
 else
 CROSS   ?=
@@ -15,33 +16,38 @@ endif
 CC      := $(CROSS)gcc
 LD      := $(CROSS)ld
 AR      := $(CROSS)ar
+OBJCOPY := $(CROSS)objcopy
 BUILD   := build
 KERNEL  := $(BUILD)/vortex.bin
+KERNEL64 := $(BUILD)/vortex.elf64
 INITRD  := $(BUILD)/initrd.tar
 ISO     := $(BUILD)/vortex.iso
-QEMU    ?= qemu-system-i386
+QEMU    ?= qemu-system-x86_64
 DISK    := $(BUILD)/disk.img
 QEMUFLAGS ?= -m 128 -vga std -serial stdio -drive file=$(DISK),format=raw,if=ide,index=0
 HELPER  := $(PYTHON) tools/build.py
 
 # ---- kernel ---------------------------------------------------------------
-CFLAGS  := -m32 -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fno-builtin \
+# No SSE/x87 in the kernel (-mgeneral-regs-only) and no red zone: interrupts
+# arrive on the stack of the code they interrupt.
+CFLAGS  := -m64 -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fno-builtin \
            -fno-stack-protector -fno-pic -fno-pie -fno-asynchronous-unwind-tables \
-           -mgeneral-regs-only -mno-red-zone -Iinclude -Isdk/include -MMD -MP
-ASFLAGS := -m32 -g
-LDFLAGS := -m elf_i386 -T linker.ld -nostdlib -z noexecstack
+           -fcf-protection=none -mcmodel=small -mgeneral-regs-only -mno-red-zone \
+           -Iinclude -Isdk/include -MMD -MP
+ASFLAGS := -m64 -g
+LDFLAGS := -m elf_x86_64 -T linker.ld -nostdlib -z noexecstack -z max-page-size=0x1000
 
 SRCS := $(wildcard boot/*.S) $(wildcard kernel/*.c)
 OBJS := $(patsubst %,$(BUILD)/%.o,$(SRCS))
 
 # ---- applications (SDK) ---------------------------------------------------
-# Position-independent, freestanding ELF32 programs linked against libvx.
+# Position-independent, freestanding ELF64 programs linked against libvx.
 # apps/bin/NAME.c -> /bin/NAME (console), apps/gui/NAME.c -> /apps/NAME (GUI).
-APP_CFLAGS  := -m32 -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-builtin \
+APP_CFLAGS  := -m64 -std=gnu11 -O2 -Wall -Wextra -ffreestanding -fno-builtin \
                -fno-stack-protector -fPIE -fvisibility=hidden \
-               -fno-asynchronous-unwind-tables -mgeneral-regs-only \
-               -Isdk/include -MMD -MP
-APP_LDFLAGS := -m elf_i386 -pie --no-dynamic-linker -nostdlib -e _start \
+               -fno-asynchronous-unwind-tables -fcf-protection=none \
+               -mgeneral-regs-only -Isdk/include -MMD -MP
+APP_LDFLAGS := -m elf_x86_64 -pie --no-dynamic-linker -nostdlib -e _start \
                -z noexecstack -z norelro -z noseparate-code
 LIBVX       := $(BUILD)/sdk/libvx.a
 
@@ -67,7 +73,7 @@ endif
 ifeq ($(OS),Windows_NT)
 ifeq ($(findstring elf,$(shell $(HELPER) cc $(CC))),)
 $(error '$(CC)' is missing or is not an ELF cross compiler. Download \
-i686-elf-tools-windows.zip from github.com/lordmilko/i686-elf-tools/releases, \
+x86_64-elf-tools-windows.zip from github.com/lordmilko/i686-elf-tools/releases, \
 unpack it and add its bin folder to PATH. See README.md)
 endif
 endif
@@ -75,8 +81,14 @@ endif
 
 apps: $(APP_ELFS)
 
-$(KERNEL): $(OBJS) linker.ld
+# The kernel is linked as 64-bit ELF (keep it for debuggers) and then wrapped
+# into an ELF32 container: Multiboot 1 loaders (qemu -kernel, GRUB's
+# `multiboot` command) only load 32-bit ELF files. The code inside is the same.
+$(KERNEL64): $(OBJS) linker.ld
 	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+
+$(KERNEL): $(KERNEL64)
+	$(OBJCOPY) -O elf32-i386 $< $@
 
 $(BUILD)/%.c.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@

@@ -3,7 +3,7 @@
  *   #include <vortex.h>
  *   int main(int argc, char **argv) { printf("Hello!\n"); return 0; }
  *
- * Programs are freestanding, position-independent ELF32 executables linked
+ * Programs are freestanding, position-independent 64-bit ELF executables linked
  * against libvx (sdk/lib). Build flags live in the top-level Makefile; the
  * quickest start is `tools/new-app.sh <name> [gui]`.
  */
@@ -16,12 +16,16 @@
 #include <vortex/abi.h>
 
 /* ---- raw system call --------------------------------------------------- */
-static inline int vx_syscall(int nr, long a, long b, long c, long d, long e)
+/* Number in rax, arguments in rdi, rsi, rdx, r10, r8; the result comes back
+ * in rax. All other registers are preserved by the kernel. */
+static inline long vx_syscall(long nr, long a, long b, long c, long d, long e)
 {
-    int ret;
+    long ret;
+    register long r10 __asm__("r10") = d;
+    register long r8  __asm__("r8")  = e;
     __asm__ volatile("int $0x80"
                      : "=a"(ret)
-                     : "a"(nr), "b"(a), "c"(b), "d"(c), "S"(d), "D"(e)
+                     : "a"(nr), "D"(a), "S"(b), "d"(c), "r"(r10), "r"(r8)
                      : "memory", "cc");
     return ret;
 }

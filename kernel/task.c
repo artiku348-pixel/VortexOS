@@ -9,9 +9,9 @@
 
 #define STACK_SIZE (64 * 1024)
 
-struct alloc_hdr { struct alloc_hdr *prev, *next; u32 pad[2]; };
+struct alloc_hdr { struct alloc_hdr *prev, *next; };
 
-void switch_context(u32 *old_esp, u32 new_esp);
+void switch_context(u64 *old_rsp, u64 new_rsp);
 
 static struct task tasks[TASK_MAX];
 static struct task *cur;
@@ -73,13 +73,15 @@ struct task *task_create(const char *name, void (*entry)(void *), void *arg)
     strlcpy(t->name, name, sizeof(t->name));
     strcpy(t->cwd, cur->cwd);
 
-    /* Frame consumed by switch_context: edi, esi, ebx, ebp, eflags, ret. */
-    u32 *sp = (u32 *)((u8 *)stack + STACK_SIZE);
+    /* Frame consumed by switch_context: r15, r14, r13, r12, rbx, rbp, rflags,
+     * ret. The fake return address also gives trampoline the stack alignment
+     * of a normal call. */
+    u64 *sp = (u64 *)((u8 *)stack + STACK_SIZE);
     *--sp = 0;                          /* fake return address of trampoline */
-    *--sp = (u32)trampoline;
-    *--sp = 0x002;                      /* eflags: interrupts off until trampoline */
-    *--sp = 0; *--sp = 0; *--sp = 0; *--sp = 0;
-    t->esp = (u32)sp;
+    *--sp = (u64)trampoline;
+    *--sp = 0x002;                      /* rflags: interrupts off until trampoline */
+    for (int i = 0; i < 6; i++) *--sp = 0;
+    t->rsp = (u64)sp;
     t->state = TASK_READY;
     return t;
 }
@@ -99,9 +101,9 @@ void task_yield(void)
         if (t->state != TASK_READY) continue;
         if (t == prev) return;
         cur = t;
-        tss_set_kernel_stack((u32)t->stack + STACK_SIZE);
+        tss_set_kernel_stack((u64)t->stack + STACK_SIZE);
         vmm_switch(t->pagedir);
-        switch_context(&prev->esp, t->esp);
+        switch_context(&prev->rsp, t->rsp);
         return;
     }
 }
@@ -141,11 +143,11 @@ static void cleanup(struct task *t)
 
     while (t->allocs) task_free(t, (struct alloc_hdr *)t->allocs + 1);
 
-    u32 *dir = t->pagedir;              /* user process: release its address space */
+    u64 *dir = t->pagedir;              /* user process: release its address space */
     t->pagedir = NULL;
     if (dir) {
         if (t == cur) vmm_switch(NULL);
-        vmm_free_dir(dir);
+        vmm_free_space(dir);
     }
 }
 

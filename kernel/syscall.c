@@ -57,12 +57,12 @@ static int sys_win_event(int me, int win, struct vx_event *ev, int timeout_ms)
     }
 }
 
-static int sys_sbrk(struct task *t, u32 bytes)
+static i64 sys_sbrk(struct task *t, u64 bytes)
 {
-    u32 old = t->brk;
-    if (bytes > 256u * 1024 * 1024 || vmm_alloc(t->pagedir, old, bytes)) return -1;
+    u64 old = t->brk;
+    if (bytes > 256ul * 1024 * 1024 || vmm_alloc(t->pagedir, old, bytes)) return -1;
     t->brk = old + bytes;
-    return (int)old;
+    return (i64)old;
 }
 
 /* Pointer checks: user programs may only hand us memory they own. */
@@ -73,20 +73,21 @@ static int sys_sbrk(struct task *t, u32 bytes)
 void syscall_dispatch(struct regs *r)
 {
     struct task *t = task_current();
-    u32 a = r->ebx, b = r->ecx, c = r->edx, d = r->esi, e = r->edi;
-    int ret = -1;
+    /* Number in rax; arguments in rdi, rsi, rdx, r10, r8; result in rax. */
+    u64 a = r->rdi, b = r->rsi, c = r->rdx, d = r->r10, e = r->r8;
+    i64 ret = -1;
 
     if ((r->cs & 3) != 3 || !t->pagedir) goto bad;  /* system calls come from user mode */
 
-    switch (r->eax) {
+    switch (r->rax) {
     case VX_SYS_EXIT:   task_exit((int)a);
     case VX_SYS_WRITE:
         BUF(a, b);
-        for (u32 i = 0; i < b; i++) kputc(((const char *)a)[i]);
+        for (u64 i = 0; i < b; i++) kputc(((const char *)a)[i]);
         ret = (int)b;
         break;
     case VX_SYS_GETKEY: ret = console_getchar(); break;
-    case VX_SYS_SLEEP:  sleep_ms(a); ret = 0; break;
+    case VX_SYS_SLEEP:  sleep_ms((u32)a); ret = 0; break;
     case VX_SYS_TICKS:  ret = (int)timer_ticks(); break;
     case VX_SYS_TIME:   BUF(a, sizeof(struct vx_time)); rtc_read((struct vx_time *)a); ret = 0; break;
     case VX_SYS_YIELD:  task_yield(); ret = 0; break;
@@ -97,7 +98,7 @@ void syscall_dispatch(struct regs *r)
         STR(a);
         if ((int)b < 0 || b > 16) goto bad;
         BUF(c, b * sizeof(char *));
-        for (u32 i = 0; i < b; i++) STR(((char **)c)[i]);
+        for (u64 i = 0; i < b; i++) STR(((char **)c)[i]);
         ret = sys_spawn((const char *)a, (int)b, (char **)c);
         break;
     case VX_SYS_WAIT:   ret = sys_wait((int)a); break;
@@ -131,12 +132,12 @@ void syscall_dispatch(struct regs *r)
         BUF(b, sizeof(struct vx_rect));
         const struct vx_rect *rc = (const struct vx_rect *)b;
         if (rc->w <= 0 || rc->h <= 0 || rc->w > 4096 || rc->h > 4096) goto bad;
-        BUF(c, (u32)(rc->w * rc->h) * sizeof(u32));
+        BUF(c, (u64)(rc->w * rc->h) * sizeof(u32));
         ret = wm_blit(t->id, (int)a, rc, (const u32 *)c);
         break;
     }
     case VX_SYS_WIN_EVENT:   BUF(b, sizeof(struct vx_event)); ret = sys_win_event(t->id, (int)a, (struct vx_event *)b, (int)c); break;
     }
 bad:
-    r->eax = (u32)ret;
+    r->rax = (u64)ret;
 }

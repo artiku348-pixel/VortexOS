@@ -1,21 +1,23 @@
 /* IDT, 8259 PIC remap, exception reporting and IRQ dispatch. */
 #include "kernel.h"
 
-struct idt_entry {
+struct idt_entry {                      /* 64-bit interrupt gate: 16 bytes */
     u16 off_low;
     u16 selector;
-    u8  zero;
+    u8  ist;
     u8  type;
-    u16 off_high;
+    u16 off_mid;
+    u32 off_high;
+    u32 zero;
 } __attribute__((packed));
 
 struct table_ptr {
     u16 limit;
-    u32 base;
+    u64 base;
 } __attribute__((packed));
 
 void idt_flush(const struct table_ptr *p);
-extern const u32 isr_stub_table[48];
+extern const u64 isr_stub_table[48];
 void isr_stub_syscall(void);
 
 static struct idt_entry idt[256];
@@ -69,15 +71,15 @@ void interrupt_dispatch(struct regs *r)
         const char *name = exc_names[r->int_no];
         struct task *t = task_current();
 
-        u32 cr2 = 0;
+        u64 cr2 = 0;
         if (r->int_no == 14) __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
 
         if (t && t->id > 1) {           /* a faulting task dies; the system lives */
             t->cap = NULL;
             console_color(VX_LIGHT_RED, VX_BLACK);
-            kprintf("\n[%d] %s crashed: %s (EIP=%08x", t->id, t->name,
-                    name ? name : "Reserved", r->eip);
-            if (r->int_no == 14) kprintf(", address %08x", cr2);
+            kprintf("\n[%d] %s crashed: %s (RIP=%016lx", t->id, t->name,
+                    name ? name : "Reserved", r->rip);
+            if (r->int_no == 14) kprintf(", address %016lx", cr2);
             kputs(")\n");
             console_color(VX_LIGHT_GREY, VX_BLACK);
             task_exit(-1);
@@ -87,16 +89,17 @@ void interrupt_dispatch(struct regs *r)
         if (t) { t->cap = NULL; t->con = &kcon; }
         console_emergency();
         console_color(VX_WHITE, VX_RED);
-        kprintf("\n*** CPU EXCEPTION %u: %s (err=%x) ***\n",
+        kprintf("\n*** CPU EXCEPTION %lu: %s (err=%lx) ***\n",
                 r->int_no, name ? name : "Reserved", r->err_code);
-        kprintf("EIP=%08x CS=%04x EFLAGS=%08x CR2=%08x\n", r->eip, r->cs, r->eflags, cr2);
-        kprintf("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n", r->eax, r->ebx, r->ecx, r->edx);
-        kprintf("ESI=%08x EDI=%08x EBP=%08x\n", r->esi, r->edi, r->ebp);
+        kprintf("RIP=%016lx CS=%04lx RFLAGS=%08lx\n", r->rip, r->cs, r->rflags);
+        kprintf("RSP=%016lx CR2=%016lx\n", r->rsp, cr2);
+        kprintf("RAX=%016lx RBX=%016lx\nRCX=%016lx RDX=%016lx\n", r->rax, r->rbx, r->rcx, r->rdx);
+        kprintf("RSI=%016lx RDI=%016lx\nRBP=%016lx R8 =%016lx\n", r->rsi, r->rdi, r->rbp, r->r8);
         kputs("System halted.\n");
         for (;;) cpu_hlt();
     }
 
-    u32 irq = r->int_no - 32;
+    u64 irq = r->int_no - 32;
     if (irq < 16) {
         if (irq_handlers[irq]) irq_handlers[irq](r);
         if (irq >= 8) outb(PIC2, 0x20); /* EOI */
@@ -111,24 +114,26 @@ void interrupt_dispatch(struct regs *r)
     }
 }
 
-static void set_gate(int i, u32 addr, u8 type)
+static void set_gate(int i, u64 addr, u8 type)
 {
     idt[i].off_low  = (u16)addr;
-    idt[i].selector = 0x08;
-    idt[i].zero     = 0;
+    idt[i].selector = SEL_KCODE;
+    idt[i].ist      = 0;
     idt[i].type     = type;
-    idt[i].off_high = (u16)(addr >> 16);
+    idt[i].off_mid  = (u16)(addr >> 16);
+    idt[i].off_high = (u32)(addr >> 32);
+    idt[i].zero     = 0;
 }
 
 void idt_init(void)
 {
-    for (int i = 0; i < 48; i++)        /* present, ring 0, 32-bit interrupt gate */
+    for (int i = 0; i < 48; i++)        /* present, ring 0, 64-bit interrupt gate */
         set_gate(i, isr_stub_table[i], 0x8E);
     /* System calls use a trap gate: interrupts stay enabled so that a
      * blocking call can wait for the timer and the keyboard. */
-    set_gate(128, (u32)isr_stub_syscall, 0xEF);  /* DPL 3: callable from user mode */
+    set_gate(128, (u64)isr_stub_syscall, 0xEF);  /* DPL 3: callable from user mode */
     idt_ptr.limit = sizeof(idt) - 1;
-    idt_ptr.base  = (u32)idt;
+    idt_ptr.base  = (u64)idt;
     idt_flush(&idt_ptr);
     pic_remap();
 }

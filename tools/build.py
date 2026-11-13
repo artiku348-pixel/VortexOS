@@ -75,13 +75,13 @@ def find_qemu(name):
 
 
 def qemu(args):
-    name = "qemu-system-i386"
+    name = "qemu-system-x86_64"
     if args and not args[0].startswith("-"):
         name, args = args[0], args[1:]
     exe = find_qemu(name)
     if not exe:
         sys.exit("%s not found. Install QEMU (https://www.qemu.org/download/) "
-                 "or pass its path: make run QEMU=C:/path/to/qemu-system-i386.exe" % name)
+                 "or pass its path: make run QEMU=C:/path/to/qemu-system-x86_64.exe" % name)
     return subprocess.call([exe] + args)
 
 
