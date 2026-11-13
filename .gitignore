@@ -53,3 +53,6 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# VortexOS build output
+build/
