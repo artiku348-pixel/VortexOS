@@ -56,18 +56,45 @@
 
 ## Сборка и запуск
 
-Нужны `gcc` с поддержкой `-m32`, `binutils`, `make`, `tar`; для запуска — QEMU.
+Команды одинаковы на Linux, macOS и Windows:
 
 ```sh
-make              # build/vortex.bin + build/initrd.tar
-make run          # запуск в QEMU   (или tools/run.sh)
-make iso          # загрузочный ISO (нужны grub-mkrescue и xorriso)
-make run-iso
+make              # build/vortex.bin + build/initrd.tar + build/disk.img
+make run          # запуск в QEMU
 make test         # автотест без QEMU (pip install unicorn)
+make disk         # пересоздать образ диска
 make clean
+make iso          # загрузочный ISO (только Linux: grub-mkrescue и xorriso)
+make run-iso
 ```
 
-С кросс-компилятором: `make CROSS=i686-elf-`.
+Для сборки нужны только `make`, компилятор и Python 3: все операции с файлами
+выполняет `tools/build.py`, утилиты Unix (`mkdir -p`, `cp`, `find`, `tar`) не
+используются.
+
+**Linux** (Debian/Ubuntu):
+`sudo apt install build-essential gcc-multilib python3 qemu-system-x86`
+
+**Windows** (обычная командная строка, без WSL):
+
+1. [Python 3](https://www.python.org/downloads/) — при установке отметьте
+   «Add python.exe to PATH».
+2. Кросс-компилятор `i686-elf-gcc`: скачайте `i686-elf-tools-windows.zip` со
+   страницы <https://github.com/lordmilko/i686-elf-tools/releases>, распакуйте,
+   например, в `C:\i686-elf-tools` и добавьте `C:\i686-elf-tools\bin` в `PATH`.
+   Обычный MinGW gcc не подходит: он создаёт программы Windows (PE), а ядру
+   нужен формат ELF.
+3. [QEMU для Windows](https://www.qemu.org/download/#windows). Если он
+   установлен в `C:\Program Files\qemu`, `make run` найдёт его сам; иначе
+   `make run QEMU=C:/путь/qemu-system-i386.exe`.
+4. GNU make (он у вас уже есть, если команда `make` запускается).
+
+Проверка: `python --version`, `i686-elf-gcc --version`, затем `make` и
+`make run` в папке проекта. Если чего-то не хватает, `make` скажет, чего именно.
+
+**macOS**: `brew install i686-elf-gcc qemu`, затем `make CROSS=i686-elf-`.
+
+Другой компилятор или Python: `make CROSS=префикс- PYTHON=путь`.
 
 После загрузки: `help`, `ls /bin`, `sysinfo`, `greet World`, `hello`, `desktop`.
 На рабочем столе: меню **Vortex** слева внизу; в терминале `calc &` запускает

@@ -10,6 +10,7 @@ own IDT. Screenshots of the framebuffer are written to build/*.png.
 """
 import os
 import struct
+import threading
 import sys
 import zlib
 
@@ -23,6 +24,7 @@ MBI = 0x9000
 LFB = 0xFD000000
 UNTIL = 0x100000                # emu_start() end address: mapped, never executed
 UNTIL_USER = 0x7FFFF000        # same, for ring 3: top page of the user stack
+HANG_SECONDS = 120              # a single run() may not take longer
 SLICE = 20000                   # microseconds of emulation per time slice
 ERROR_CODE = (8, 10, 11, 12, 13, 14, 17)
 W, H = 1024, 768
@@ -63,6 +65,7 @@ class Machine:
         self.pci_addr = 0
         self.cmos_reg = 0
         self.pending = None
+        self.hung = False
         self.disk = disk                # bytearray with the ATA disk contents, or None
         self.ata = {"regs": [0] * 8, "buf": bytearray(), "status": 0x50, "write": None}
         self.disk_writes = 0
@@ -297,6 +300,19 @@ class Machine:
 
         If a user program keeps the CPU busy, play the timer: preempt it at the
         end of each time slice and return None after a few slices."""
+        watchdog = threading.Timer(HANG_SECONDS, self.hang)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            return self.run_slices()
+        finally:
+            watchdog.cancel()
+
+    def hang(self):
+        self.hung = True
+        self.uc.emu_stop()
+
+    def run_slices(self):
         busy = 0
         for _ in range(100000):
             self.pending = None
@@ -305,13 +321,20 @@ class Machine:
                 # mapped at the privilege level the CPU stops in; a stray fault
                 # there would turn the next real fault into a double fault.
                 # watch_iret() makes sure a run never crosses from ring 0 to 3.
+                #
+                # Kernel code runs until it halts, with no time limit: a stop
+                # in the middle of an I/O instruction would make Unicorn repeat
+                # it (and e.g. read a word from the disk twice). Only user
+                # code gets time slices; a watchdog catches a stuck kernel.
                 user = self.to_user or self.uc.reg_read(UC_X86_REG_CS) & 3
-                self.uc.emu_start(self.pc, UNTIL_USER if user else UNTIL, timeout=SLICE)
+                self.uc.emu_start(self.pc, UNTIL_USER if user else UNTIL,
+                                  timeout=SLICE if user else 0)
             except UcError as e:
                 if e.errno != UC_ERR_INSN_INVALID:
                     raise
                 self.pending = 6        # #UD
             eip = self.uc.reg_read(UC_X86_REG_EIP)
+            assert not self.hung, "kernel hang at %#x" % eip
             if self.pending is not None:
                 if self.pending < 32:
                     self.clear_fault(self.pending)
@@ -438,7 +461,7 @@ def disk_test(kernel, initrd, bits, mbr=False, gui=False):
     mkfat, src = fat_tools()
     size = {12: 2, 16: 16, 32: 40}[bits]
     disk = bytearray(mkfat.Builder(size, bits).build(src, mbr=mbr))
-    hello = open(os.path.join(os.path.dirname(kernel) or ".", "rootfs/bin/hello"), "rb").read()
+    hello = open(os.path.join(os.path.dirname(kernel) or ".", "apps/bin/hello"), "rb").read()
     welcome = open(os.path.join(src, "welcome.txt"), "rb").read()
     free0 = mkfat.Volume(bytes(disk)).check()
 
@@ -569,7 +592,7 @@ def disk_full_test(kernel, initrd):
     """A tiny FAT12 volume: fill it up, then make room again."""
     mkfat, src = fat_tools()
     disk = bytearray(mkfat.Builder(bits=12, sectors=400).build(src))
-    hello = open(os.path.join(os.path.dirname(kernel) or ".", "rootfs/bin/hello"), "rb").read()
+    hello = open(os.path.join(os.path.dirname(kernel) or ".", "apps/bin/hello"), "rb").read()
     fit = mkfat.Volume(bytes(disk)).check() // ((len(hello) + 511) // 512 * 512)
     count = fit + 4
     m = Machine(kernel, initrd, disk)
