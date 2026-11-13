@@ -1,7 +1,10 @@
-/* Cooperative multitasking: kernel threads that switch only at task_yield()
- * (blocking calls such as reading a key, sleeping or waiting for a window
- * event yield in a loop). Task 0 is the kernel/main shell, task 1 is the
- * idle task that halts the CPU until the next interrupt. */
+/* Tasks and the round-robin scheduler.
+ *
+ * Every task has a kernel stack; user processes additionally have their own
+ * address space and run in ring 3. Kernel code switches tasks only at
+ * task_yield() (blocking calls yield in a loop), while user code is preempted
+ * by any interrupt (see interrupt_dispatch). Task 0 is the kernel/main shell,
+ * task 1 is the idle task that halts the CPU until the next interrupt. */
 #include "kernel.h"
 
 #define STACK_SIZE (64 * 1024)
@@ -96,6 +99,8 @@ void task_yield(void)
         if (t->state != TASK_READY) continue;
         if (t == prev) return;
         cur = t;
+        tss_set_kernel_stack((u32)t->stack + STACK_SIZE);
+        vmm_switch(t->pagedir);
         switch_context(&prev->esp, t->esp);
         return;
     }
@@ -135,6 +140,13 @@ static void cleanup(struct task *t)
                 task_kill(tasks[i].id);
 
     while (t->allocs) task_free(t, (struct alloc_hdr *)t->allocs + 1);
+
+    u32 *dir = t->pagedir;              /* user process: release its address space */
+    t->pagedir = NULL;
+    if (dir) {
+        if (t == cur) vmm_switch(NULL);
+        vmm_free_dir(dir);
+    }
 }
 
 void task_exit(int code)

@@ -43,6 +43,38 @@ gdt_flush:
     ljmp $0x08, $1f
 1:  ret
 
+/* void tss_flush(void) */
+.global tss_flush
+tss_flush:
+    mov  $0x28, %ax
+    ltr  %ax
+    ret
+
+/* void enter_user(u32 entry, u32 user_esp): drop to ring 3 and never return.
+ * The next interrupt or system call starts at the top of the kernel stack. */
+.global enter_user
+enter_user:
+    mov  4(%esp), %ecx
+    mov  8(%esp), %edx
+    mov  $0x23, %ax
+    mov  %ax, %ds
+    mov  %ax, %es
+    mov  %ax, %fs
+    mov  %ax, %gs
+    push $0x23                          /* ss */
+    push %edx                           /* esp */
+    push $0x202                         /* eflags: interrupts enabled */
+    push $0x1B                          /* cs */
+    push %ecx                           /* eip */
+    xor  %eax, %eax
+    xor  %ebx, %ebx
+    xor  %ecx, %ecx
+    xor  %edx, %edx
+    xor  %esi, %esi
+    xor  %edi, %edi
+    xor  %ebp, %ebp
+    iret
+
 /* void idt_flush(const struct table_ptr *p) */
 .global idt_flush
 idt_flush:

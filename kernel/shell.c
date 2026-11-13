@@ -80,6 +80,9 @@ static int cmd_mem(int argc, char **argv)
     heap_stats(&total, &used, &blocks);
     kprintf("RAM:  %u KiB lower, %u KiB upper\n", g_mem_lower_kb, g_mem_upper_kb);
     kprintf("Heap: %u KiB total, %u KiB used, %u block(s)\n", total / 1024, used / 1024, blocks);
+    u32 frames, free;
+    pmm_stats(&frames, &free);
+    kprintf("Page frames: %u total, %u free (%u KiB free for programs)\n", frames, free, free * 4);
     return 0;
 }
 
@@ -267,10 +270,11 @@ static int cmd_which(int argc, char **argv)
 static int cmd_ps(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    kputs("  ID  NAME\n");
+    kputs("  ID  MODE    NAME\n");
     for (int i = 0; i < TASK_MAX; i++) {
         struct task *t = task_slot(i);
-        if (t->state == TASK_READY) kprintf("%4d  %s\n", t->id, t->name);
+        if (t->state == TASK_READY)
+            kprintf("%4d  %s  %s\n", t->id, t->pagedir ? "user  " : "kernel", t->name);
     }
     return 0;
 }

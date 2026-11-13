@@ -41,6 +41,8 @@ static inline void vx_time(struct vx_time *t)       { VX_CALL1(VX_SYS_TIME, t); 
 static inline void vx_yield(void)                   { VX_CALL0(VX_SYS_YIELD); }
 static inline void vx_color(int fg, int bg)         { VX_CALL2(VX_SYS_COLOR, fg, bg); }
 static inline void vx_clear(void)                   { VX_CALL0(VX_SYS_CLEAR); }
+/* Grow the heap by `bytes`; returns the old end of the heap or (void *)-1. */
+static inline void *vx_sbrk(size_t bytes)           { return (void *)VX_CALL1(VX_SYS_SBRK, bytes); }
 /* Start a program found via $PATH; returns its task id or -1. */
 static inline int  vx_spawn(const char *name, int argc, char **argv)
                                                     { return VX_CALL3(VX_SYS_SPAWN, name, argc, argv); }
@@ -115,7 +117,7 @@ int    printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int    snprintf(char *buf, size_t max, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 int    vsnprintf(char *buf, size_t max, const char *fmt, va_list ap);
 
-void  *malloc(size_t size);                         /* released automatically on exit */
+void  *malloc(size_t size);                         /* all memory is released on exit */
 void   free(void *ptr);
 void   srand(unsigned seed);
 int    rand(void);

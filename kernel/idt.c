@@ -69,11 +69,16 @@ void interrupt_dispatch(struct regs *r)
         const char *name = exc_names[r->int_no];
         struct task *t = task_current();
 
+        u32 cr2 = 0;
+        if (r->int_no == 14) __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
+
         if (t && t->id > 1) {           /* a faulting task dies; the system lives */
             t->cap = NULL;
             console_color(VX_LIGHT_RED, VX_BLACK);
-            kprintf("\n[%d] %s crashed: %s (EIP=%08x)\n", t->id, t->name,
+            kprintf("\n[%d] %s crashed: %s (EIP=%08x", t->id, t->name,
                     name ? name : "Reserved", r->eip);
+            if (r->int_no == 14) kprintf(", address %08x", cr2);
+            kputs(")\n");
             console_color(VX_LIGHT_GREY, VX_BLACK);
             task_exit(-1);
         }
@@ -84,7 +89,7 @@ void interrupt_dispatch(struct regs *r)
         console_color(VX_WHITE, VX_RED);
         kprintf("\n*** CPU EXCEPTION %u: %s (err=%x) ***\n",
                 r->int_no, name ? name : "Reserved", r->err_code);
-        kprintf("EIP=%08x CS=%04x EFLAGS=%08x\n", r->eip, r->cs, r->eflags);
+        kprintf("EIP=%08x CS=%04x EFLAGS=%08x CR2=%08x\n", r->eip, r->cs, r->eflags, cr2);
         kprintf("EAX=%08x EBX=%08x ECX=%08x EDX=%08x\n", r->eax, r->ebx, r->ecx, r->edx);
         kprintf("ESI=%08x EDI=%08x EBP=%08x\n", r->esi, r->edi, r->ebp);
         kputs("System halted.\n");
@@ -96,6 +101,13 @@ void interrupt_dispatch(struct regs *r)
         if (irq_handlers[irq]) irq_handlers[irq](r);
         if (irq >= 8) outb(PIC2, 0x20); /* EOI */
         outb(PIC1, 0x20);
+
+        /* Preemption: an interrupt that arrives while a user program runs
+         * takes the CPU away from it. Kernel code is never preempted. */
+        if ((r->cs & 3) == 3) {
+            task_poke();
+            task_yield();
+        }
     }
 }
 
@@ -114,7 +126,7 @@ void idt_init(void)
         set_gate(i, isr_stub_table[i], 0x8E);
     /* System calls use a trap gate: interrupts stay enabled so that a
      * blocking call can wait for the timer and the keyboard. */
-    set_gate(128, (u32)isr_stub_syscall, 0x8F);
+    set_gate(128, (u32)isr_stub_syscall, 0xEF);  /* DPL 3: callable from user mode */
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (u32)idt;
     idt_flush(&idt_ptr);

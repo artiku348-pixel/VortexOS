@@ -221,8 +221,58 @@ char *gets_s(char *buf, size_t max)
 
 /* ---- misc -------------------------------------------------------------- */
 
-void *malloc(size_t size) { return (void *)VX_CALL1(VX_SYS_ALLOC, size); }
-void  free(void *ptr)     { VX_CALL1(VX_SYS_FREE, ptr); }
+/* malloc: a first-fit free list over memory obtained with vx_sbrk(). */
+struct block {
+    size_t size;                        /* payload bytes */
+    int    free;
+    struct block *next;
+    int    pad;
+};
+static struct block *heap_head, *heap_tail;
+
+void *malloc(size_t size)
+{
+    if (!size) return NULL;
+    size = (size + 15) & ~(size_t)15;
+
+    struct block *b = heap_head;
+    while (b && !(b->free && b->size >= size)) b = b->next;
+    if (!b) {                           /* grow the heap */
+        size_t chunk = size + sizeof(*b);
+        if (chunk < 64 * 1024) chunk = 64 * 1024;
+        b = vx_sbrk(chunk);
+        if (b == (void *)-1) return NULL;
+        b->size = chunk - sizeof(*b);
+        b->next = NULL;
+        if (heap_tail) heap_tail->next = b;
+        else heap_head = b;
+        heap_tail = b;
+    }
+    if (b->size >= size + sizeof(*b) + 16) {        /* split the remainder off */
+        struct block *rest = (struct block *)((char *)(b + 1) + size);
+        rest->size = b->size - size - sizeof(*b);
+        rest->free = 1;
+        rest->next = b->next;
+        b->size = size;
+        b->next = rest;
+        if (heap_tail == b) heap_tail = rest;
+    }
+    b->free = 0;
+    return b + 1;
+}
+
+void free(void *ptr)
+{
+    if (!ptr) return;
+    ((struct block *)ptr - 1)->free = 1;
+    for (struct block *b = heap_head; b; b = b->next)       /* merge free neighbours */
+        while (b->free && b->next && b->next->free &&
+               (char *)(b + 1) + b->size == (char *)b->next) {
+            if (heap_tail == b->next) heap_tail = b;
+            b->size += sizeof(*b) + b->next->size;
+            b->next = b->next->next;
+        }
+}
 
 static unsigned rand_state = 12345;
 void srand(unsigned seed) { rand_state = seed; }

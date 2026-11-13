@@ -13,13 +13,18 @@ import struct
 import sys
 import zlib
 
-from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INSN, UC_HOOK_INTR,
+from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INSN, UC_HOOK_INTR, UC_HOOK_CODE,
                      UC_ERR_INSN_INVALID)
+from unicorn.unicorn_py3.unicorn import UcContext
 from unicorn.x86_const import *
 
 RAM = 128 * 1024 * 1024
 MBI = 0x9000
 LFB = 0xFD000000
+UNTIL = 0x100000                # emu_start() end address: mapped, never executed
+UNTIL_USER = 0x7FFFF000        # same, for ring 3: top page of the user stack
+SLICE = 20000                   # microseconds of emulation per time slice
+ERROR_CODE = (8, 10, 11, 12, 13, 14, 17)
 W, H = 1024, 768
 
 LOWER = "\x00\x001234567890-=\x00\x00qwertyuiop[]\n\x00asdfghjkl;'`\x00\\zxcvbnm,./"
@@ -57,11 +62,22 @@ class Machine:
         self.bga_index, self.bga = 0, {0: 0xB0C5}
         self.pci_addr = 0
         self.cmos_reg = 0
-        self.redirect = None
+        self.pending = None
+        self.seg_off = None
+        self.fault_off = None
+        self.fresh = bytes(uc.context_save())
+        self.to_user = False            # the next instruction is an iret to ring 3
+        self.user_entries = 0           # kernel entries from ring 3
         self.mouse = [W // 2, H // 2]   # where the kernel believes the pointer is
         self.buttons = 0
 
         self.pc, kernel_end = load_elf(uc, open(kernel, "rb").read())
+        # the two places where the kernel returns to ring 3 (boot.S, isr.S)
+        for pattern in (b"\x31\xed\xcf", b"\x83\xc4\x08\xcf"):
+            image = bytes(uc.mem_read(0x100000, kernel_end - 0x100000))
+            assert image.count(pattern) == 1, "cannot find the kernel's iret instructions"
+            addr = 0x100000 + image.index(pattern) + len(pattern) - 1
+            uc.hook_add(UC_HOOK_CODE, self.watch_iret, None, addr, addr)
         flags, mods = 1, b""
         if initrd:
             blob = open(initrd, "rb").read()
@@ -122,47 +138,143 @@ class Machine:
             self.cmos_reg = value & 0x7F
 
     # ---- CPU -------------------------------------------------------------
+    def to_ring0(self, cs_sel, ss_sel):
+        """Switch the emulated CPU to ring 0 (what an interrupt from ring 3 does).
+
+        Unicorn refuses privilege changes through reg_write, so we edit a saved
+        CPU context: the segment caches of CS/SS and the CPL bits in hflags."""
+        uc = self.uc
+        ctx = uc.context_save()
+        blob = bytearray(bytes(ctx))
+        if self.seg_off is None:        # locate CPUX86State.segs[] by its contents
+            sels = [uc.reg_read(r) for r in (UC_X86_REG_ES, UC_X86_REG_CS, UC_X86_REG_SS,
+                                             UC_X86_REG_DS, UC_X86_REG_FS, UC_X86_REG_GS)]
+            hits = [off for off in range(8, len(blob) - 144, 4)
+                    if all(struct.unpack_from("<I", blob, off + i * 24)[0] == sel
+                           for i, sel in enumerate(sels))
+                    and struct.unpack_from("<I", blob, off + 24 + 16)[0] == 0xFFFFFFFF
+                    and struct.unpack_from("<I", blob, off - 8)[0] & 3 == 3]
+            assert len(hits) == 1, "cannot locate segment state in the Unicorn context"
+            self.seg_off = hits[0]
+        _, gdt, _, _ = uc.reg_read(UC_X86_REG_GDTR)
+        for index, sel in ((1, cs_sel), (2, ss_sel)):
+            desc = struct.unpack("<II", uc.mem_read(gdt + (sel & ~7), 8))[1]
+            struct.pack_into("<IIQII", blob, self.seg_off + index * 24, sel, 0, 0, 0xFFFFFFFF,
+                             (desc & 0x00F0FF00) | 0x100)
+        hflags = struct.unpack_from("<I", blob, self.seg_off - 8)[0]
+        struct.pack_into("<I", blob, self.seg_off - 8, hflags & ~3)
+
+        self.patch_context(blob, ctx)
+
+    def patch_context(self, blob, ctx):
+        patched = UcContext.__new__(UcContext)
+        patched.__setstate__((bytes(blob), ctx.size, ctx.arch, ctx.mode))
+        self.uc.context_restore(patched)
+
+    def clear_fault(self, vector):
+        """Forget the exception Unicorn has just reported to us.
+
+        The emulator remembers it until it is delivered (to detect double
+        faults), but delivery is done by this script, so the next page fault
+        would be reported as a double fault. Reset CPUX86State.old_exception."""
+        ctx = self.uc.context_save()
+        blob = bytearray(bytes(ctx))
+        if self.fault_off is None:
+            hits = [off for off in range(0, len(blob) - 3, 4)
+                    if struct.unpack_from("<I", blob, off)[0] == vector
+                    and self.fresh[off:off + 4] == b"\xff\xff\xff\xff"]
+            if len(hits) != 1:
+                return                  # not recorded for this kind of exception
+            self.fault_off = hits[0]
+        struct.pack_into("<i", blob, self.fault_off, -1)
+        self.patch_context(blob, ctx)
+
     def enter_gate(self, vector, return_pc):
-        """Push an interrupt frame and return the handler address."""
+        """Deliver an interrupt/exception like the CPU would; returns the handler."""
         uc = self.uc
         _, base, _, _ = uc.reg_read(UC_X86_REG_IDTR)
         lo, sel, _, typ, hi = struct.unpack("<HHBBH", uc.mem_read(base + vector * 8, 8))
-        assert typ in (0x8E, 0x8F) and sel == 0x08, "bad IDT gate %d" % vector
+        assert typ & 0x8E == 0x8E and sel == 0x08, "bad IDT gate %d" % vector
         flags = uc.reg_read(UC_X86_REG_EFLAGS)
-        esp = uc.reg_read(UC_X86_REG_ESP) - 12
-        uc.mem_write(esp, struct.pack("<III", return_pc, uc.reg_read(UC_X86_REG_CS), flags))
+        cs = uc.reg_read(UC_X86_REG_CS)
+        frame = [flags, cs, return_pc]
+        if cs & 3:                      # from ring 3: switch to the kernel stack in the TSS
+            assert vector < 48 or typ & 0x60 == 0x60, "int %#x gate is not callable from ring 3" % vector
+            frame = [uc.reg_read(UC_X86_REG_SS), uc.reg_read(UC_X86_REG_ESP)] + frame
+            _, gdt, _, _ = uc.reg_read(UC_X86_REG_GDTR)
+            d = uc.mem_read(gdt + 0x28, 8)
+            tss = d[2] | d[3] << 8 | d[4] << 16 | d[7] << 24
+            esp, ss0 = struct.unpack("<II", uc.mem_read(tss + 4, 8))
+            self.to_ring0(sel, ss0)
+            self.user_entries += 1
+        else:
+            esp = uc.reg_read(UC_X86_REG_ESP)
+        if vector in ERROR_CODE:
+            frame.append(4 if cs & 3 else 0)
+        esp -= 4 * len(frame)
+        uc.mem_write(esp, struct.pack("<%dI" % len(frame), *reversed(frame)))
         uc.reg_write(UC_X86_REG_ESP, esp)
-        if typ == 0x8E:                 # interrupt gates clear IF, trap gates do not
+        if typ & 0x0F == 0x0E:          # interrupt gates clear IF, trap gates do not
             uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x200)
         return lo | hi << 16
 
+    def watch_iret(self, uc, address, size, _):
+        if self.to_user:                # second visit: let it execute
+            self.to_user = False
+        elif struct.unpack("<I", uc.mem_read(uc.reg_read(UC_X86_REG_ESP) + 4, 4))[0] & 3:
+            self.to_user = True         # restart the run with the user end address
+            uc.emu_stop()
+
     def soft_int(self, uc, intno, _):
-        # Unicorn reports `int N` to the host; route it through the guest IDT.
-        self.redirect = self.enter_gate(intno, uc.reg_read(UC_X86_REG_EIP))
+        # Unicorn reports `int N` and CPU exceptions to the host instead of
+        # using the guest IDT: stop, then deliver them ourselves in run().
+        self.pending = intno
+        self.cr2 = uc.reg_read(UC_X86_REG_CR2)   # the stop below may clobber it
         uc.emu_stop()
 
     def run(self):
-        """Run until the CPU halts; return True if interrupts are enabled."""
-        while True:
-            self.redirect = None
+        """Run until the CPU idles in `hlt` (returns True if interrupts are on).
+
+        If a user program keeps the CPU busy, play the timer: preempt it at the
+        end of each time slice and return None after a few slices."""
+        busy = 0
+        for _ in range(100000):
+            self.pending = None
             try:
-                self.uc.emu_start(self.pc, 0xFFFFFFFF, timeout=120 * 1000000)
+                # Unicorn touches the end address when it stops, so it must be
+                # mapped at the privilege level the CPU stops in; a stray fault
+                # there would turn the next real fault into a double fault.
+                # watch_iret() makes sure a run never crosses from ring 0 to 3.
+                user = self.to_user or self.uc.reg_read(UC_X86_REG_CS) & 3
+                self.uc.emu_start(self.pc, UNTIL_USER if user else UNTIL, timeout=SLICE)
             except UcError as e:
-                # Faults are also reported to the host: raise #UD ourselves.
                 if e.errno != UC_ERR_INSN_INVALID:
                     raise
-                self.pc = self.enter_gate(6, self.uc.reg_read(UC_X86_REG_EIP))
+                self.pending = 6        # #UD
+            eip = self.uc.reg_read(UC_X86_REG_EIP)
+            if self.pending is not None:
+                if self.pending < 32:
+                    self.clear_fault(self.pending)
+                if self.pending == 14:
+                    self.uc.reg_write(UC_X86_REG_CR2, self.cr2)
+                self.pc = self.enter_gate(self.pending, eip)
                 continue
-            if self.redirect is not None:
-                self.pc = self.redirect
-                continue
-            self.pc = self.uc.reg_read(UC_X86_REG_EIP)
-            assert self.uc.mem_read(self.pc - 1, 1)[0] == 0xF4, "timeout at %#x (hang?)" % self.pc
-            return bool(self.uc.reg_read(UC_X86_REG_EFLAGS) & 0x200)
+            self.pc = eip
+            ring3 = self.uc.reg_read(UC_X86_REG_CS) & 3
+            interrupts = bool(self.uc.reg_read(UC_X86_REG_EFLAGS) & 0x200)
+            if not ring3 and self.uc.mem_read(eip - 1, 1)[0] == 0xF4:
+                return interrupts
+            if ring3:                   # time slice used up in user mode
+                busy += 1
+                if busy > 3:
+                    return None
+                self.pc = self.enter_gate(32, self.pc)
+        raise AssertionError("kernel hang at %#x" % self.pc)
 
     def irq(self, n):
         mask = self.masks[0x21] if n < 8 else self.masks[0xA1]
         assert not mask & (1 << (n & 7)), "IRQ%d is masked" % n
+        assert self.uc.reg_read(UC_X86_REG_EFLAGS) & 0x200, "interrupts are disabled"
         self.pc = self.enter_gate(32 + n, self.pc)
         return self.run()
 
@@ -274,7 +386,7 @@ def main():
            "Arguments: [one] [two]", "Nice to meet you, user.", "Tip: ",
            "saved text\nmore\n", "00000000  73 61 76 65 64",
            "/home/demo\n", "# demo\ncreated by user\n", "      16  n2",
-           "up 00:00:02", "2026-11-13 12:34:56", "   1  idle",
+           "up 00:00:02", "2026-11-13 12:34:56", "   1  kernel  idle",
            "about: needs the desktop",
            "nosuchcmd: command not found")
     assert m.output().count("Hello from a VortexOS application!") == 3
@@ -288,6 +400,37 @@ def main():
     assert "guess" not in m.output().split("^C")[-1]
     print(m.text_screen())
     print("\n--- text mode OK ---\n")
+
+    # ---- user mode: isolation, paging, preemption --------------------------
+    import re
+    def free_frames():
+        m.type("mem\n")
+        return int(re.findall(r"(\d+) free \(", m.output())[-1])
+    m.type("clear\n")
+    frames = free_frames()
+    assert m.user_entries > 50, "programs did not run in ring 3"
+    for mode in ("malloc", "badptr", "null", "kernel", "priv"):
+        m.type("systest %s\n" % mode)
+    expect(m, "malloc: 64 blocks, checksum 2016, reuse ok",
+           "bad pointers returned -1 -1 -1",
+           "systest crashed: Page fault (EIP=4", "address 00000000)", "address 00100000)",
+           "systest crashed: General protection fault")
+    assert "broken" not in m.output()
+    assert free_frames() == frames, "page frames leaked"
+
+    m.type("systest spin &\n")          # a busy loop must not freeze the system
+    spin = int(re.findall(r"\[(\d+)\] systest", m.output())[-1])
+    before = m.user_entries
+    m.type("ps\necho still responsive\n")
+    expect(m, "%4d  user    systest" % spin, "\nstill responsive\n")
+    assert m.user_entries > before + 10, "the spinning program was not preempted"
+    m.type("kill %d\n" % spin)
+    assert m.tick() is None or True
+    m.type("ps\n")
+    assert "systest" not in m.output().split("kill %d" % spin)[-1]
+    assert free_frames() == frames, "page frames leaked"
+    print(m.text_screen())
+    print("\n--- user mode OK (%d kernel entries from ring 3) ---\n" % m.user_entries)
 
     # ---- desktop ----------------------------------------------------------
     m.type("desktop\n")

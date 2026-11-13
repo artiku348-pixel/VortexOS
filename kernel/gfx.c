@@ -44,11 +44,21 @@ static u32 find_framebuffer(void)
     return 0xE0000000;                  /* ISA Bochs default */
 }
 
-int gfx_available(void)
+static u32 fb_addr;
+
+/* Detect the adapter and locate its framebuffer. Runs once, before paging is
+ * enabled, so that the kernel can map the framebuffer into its page tables. */
+u32 gfx_probe(void)
 {
     u16 id = bga_read(BGA_ID);
-    return id >= 0xB0C0 && id <= 0xB0CF;
+    if (id < 0xB0C0 || id > 0xB0CF) return 0;
+    u32 addr = find_framebuffer();
+    if (addr < USER_TOP) return 0;      /* would collide with kernel/user space */
+    fb_addr = addr;
+    return addr;
 }
+
+int gfx_available(void) { return fb_addr != 0; }
 
 int gfx_active(void) { return active; }
 struct surface *gfx_screen(void) { return &screen; }
@@ -66,7 +76,7 @@ int gfx_init(void)
         bga_write(BGA_ENABLE, 0);
         return -1;
     }
-    screen.pix = (u32 *)find_framebuffer();
+    screen.pix = (u32 *)fb_addr;
     screen.w = SCREEN_W;
     screen.h = SCREEN_H;
     active = 1;

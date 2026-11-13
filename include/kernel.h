@@ -3,7 +3,7 @@
 
 #include <vortex/abi.h>
 
-#define VORTEX_VERSION "0.2.0"
+#define VORTEX_VERSION "0.3.0"
 
 typedef unsigned char  u8;
 typedef unsigned short u16;
@@ -80,7 +80,9 @@ struct surface {
     int w, h;
 };
 extern const u8 font8x16[95][16];
+#define GFX_FB_SIZE (4u * 1024 * 1024)   /* framebuffer bytes mapped by the kernel */
 int  gfx_available(void);               /* Bochs/QEMU VBE adapter present */
+u32  gfx_probe(void);                   /* framebuffer address (0 = none); call before paging */
 int  gfx_active(void);                  /* graphics mode is on */
 int  gfx_init(void);                    /* switch to 1024x768x32; 0 = ok */
 struct surface *gfx_screen(void);
@@ -132,9 +134,16 @@ struct regs {
     u32 edi, esi, ebp, esp, ebx, edx, ecx, eax;
     u32 int_no, err_code;
     u32 eip, cs, eflags;
+    u32 user_esp, user_ss;              /* only pushed when coming from ring 3 */
 };
 typedef void (*irq_handler_t)(struct regs *);
+#define SEL_KCODE 0x08
+#define SEL_KDATA 0x10
+#define SEL_UCODE 0x1B                  /* ring 3 selectors (RPL = 3) */
+#define SEL_UDATA 0x23
 void gdt_init(void);
+void tss_set_kernel_stack(u32 esp0);    /* stack used when ring 3 enters the kernel */
+void enter_user(u32 entry, u32 user_esp) __attribute__((noreturn));
 void idt_init(void);
 void irq_install(int irq, irq_handler_t handler);
 
@@ -152,8 +161,27 @@ struct mouse_packet { int dx, dy, buttons; };
 void mouse_init(void);
 int  mouse_poll(struct mouse_packet *p);
 
+/* ---- pmm.c / vmm.c (physical frames, paging) --------------------------- */
+#define PAGE_SIZE    4096u
+#define KERNEL_LIMIT 0x40000000u        /* kernel space: identity-mapped RAM below 1 GiB */
+#define USER_BASE    0x40000000u        /* user space: [USER_BASE, USER_TOP) */
+#define USER_TOP     0x80000000u
+void pmm_init(u32 start, u32 end);
+u32  pmm_alloc(void);                   /* zeroed frame (physical address) or 0 */
+void pmm_free(u32 addr);
+void pmm_stats(u32 *total, u32 *free);
+void vmm_init(u32 ram_end, u32 framebuffer, u32 framebuffer_size);
+u32 *vmm_kernel_dir(void);
+u32 *vmm_new_dir(void);
+void vmm_free_dir(u32 *dir);
+void vmm_switch(u32 *dir);              /* NULL = kernel directory */
+int  vmm_alloc(u32 *dir, u32 virt, u32 size);
+int  vmm_copy_to(u32 *dir, u32 virt, const void *src, u32 len);
+int  user_ok(const void *ptr, u32 len);
+int  user_str(const char *s, u32 max);
+
 /* ---- heap.c ------------------------------------------------------------ */
-void  heap_init(u32 start, u32 mem_upper_kb);
+void  heap_init(u32 start, u32 size);
 void *kmalloc(size_t size);
 void  kfree(void *ptr);
 void  heap_stats(u32 *total, u32 *used, u32 *blocks);
@@ -172,6 +200,8 @@ struct task {
     struct console *own_con;            /* console destroyed with this task */
     struct capture *cap;
     void *allocs;                       /* memory released on exit */
+    u32  *pagedir;                      /* user process: its address space (else NULL) */
+    u32   brk;                          /* user process: end of the heap */
     char  cwd[VX_PATH_MAX];
 };
 void  task_init(void);

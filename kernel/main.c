@@ -62,10 +62,22 @@ void kmain(u32 magic, const struct multiboot_info *mbi)
             if (mods[i].end > heap_start) heap_start = mods[i].end;
     }
 
-    gdt_init();                             status(1, "GDT");
+    /* Memory map: [kernel + initrd][kernel heap][page frames ............]
+     * The kernel uses at most the first 1 GiB of RAM (identity-mapped). */
+    u32 ram_end = 0x100000 + g_mem_upper_kb * 1024;
+    if (ram_end > KERNEL_LIMIT || ram_end < 0x100000) ram_end = KERNEL_LIMIT;
+    heap_start = (heap_start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    if (ram_end < heap_start + 24u * 1024 * 1024) panic("not enough memory (32 MiB required)");
+    u32 heap_size = ((ram_end - heap_start) / 2) & ~(PAGE_SIZE - 1);
+    if (heap_size > 64u * 1024 * 1024) heap_size = 64u * 1024 * 1024;
+
+    gdt_init();                             status(1, "GDT, TSS");
     idt_init();                             status(1, "IDT, PIC, system calls");
-    heap_init(heap_start, g_mem_upper_kb);
-    task_init();                            status(1, "Heap and tasks");
+    heap_init(heap_start, heap_size);
+    pmm_init(heap_start + heap_size, ram_end);
+    vmm_init(ram_end, gfx_probe(), GFX_FB_SIZE);
+    status(1, "Paging, heap, page frames");
+    task_init();                            status(1, "Scheduler, user mode");
     timer_init();
     keyboard_init();
     mouse_init();                           status(1, "Timer, keyboard, mouse");
