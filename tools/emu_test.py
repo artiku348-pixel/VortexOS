@@ -7,13 +7,19 @@ the PS/2 keyboard and mouse, the CMOS clock, the serial port and a Bochs VBE
 graphics card with a linear framebuffer. Whenever the kernel idles in `hlt`
 we deliver the next timer / keyboard / mouse interrupt through the kernel's
 own IDT. Screenshots of the framebuffer are written to build/*.png.
+
+The kernel is 64-bit. Its 32-bit boot code (boot/boot.S) runs first in a
+separate 32-bit CPU until it has switched to long mode; the memory it has
+prepared (page tables, GDT) is then handed to the 64-bit CPU that runs the
+rest, because Unicorn cannot change the register width of a running CPU.
 """
 import os
 import struct
+import threading
 import sys
 import zlib
 
-from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_HOOK_INSN, UC_HOOK_INTR, UC_HOOK_CODE,
+from unicorn import (Uc, UcError, UC_ARCH_X86, UC_MODE_32, UC_MODE_64, UC_HOOK_INSN, UC_HOOK_INTR, UC_HOOK_CODE,
                      UC_ERR_INSN_INVALID)
 from unicorn.unicorn_py3.unicorn import UcContext
 from unicorn.x86_const import *
@@ -22,7 +28,9 @@ RAM = 128 * 1024 * 1024
 MBI = 0x9000
 LFB = 0xFD000000
 UNTIL = 0x100000                # emu_start() end address: mapped, never executed
-UNTIL_USER = 0x7FFFF000        # same, for ring 3: top page of the user stack
+UNTIL_USER = 0xFFFFFFF000      # same, for ring 3: top page of the user stack
+EFER = 0xC0000080
+HANG_SECONDS = 120              # a single run() may not take longer
 SLICE = 20000                   # microseconds of emulation per time slice
 ERROR_CODE = (8, 10, 11, 12, 13, 14, 17)
 W, H = 1024, 768
@@ -36,22 +44,57 @@ EXTENDED = {"UP": 0x48, "DOWN": 0x50, "LEFT": 0x4B, "RIGHT": 0x4D, "DELETE": 0x5
 
 
 def load_elf(uc, data):
-    assert data[:4] == b"\x7fELF" and data[4] == 1, "expected a 32-bit ELF"
+    """Load the kernel (64-bit code in an ELF32 container). Returns the entry
+    point, the end of the image and its symbol table."""
+    assert data[:4] == b"\x7fELF" and data[4] == 1, "expected an ELF32 container"
     assert struct.pack("<I", 0x1BADB002) in data[:0x3000], "no multiboot header"
-    entry, phoff = struct.unpack_from("<II", data, 24)
-    phentsize, phnum = struct.unpack_from("<HH", data, 42)
+    entry, phoff, shoff = struct.unpack_from("<III", data, 24)
+    phentsize, phnum, shentsize, shnum = struct.unpack_from("<HHHH", data, 42)
     end = 0
     for i in range(phnum):
         p_type, off, _, paddr, filesz, memsz, _, _ = struct.unpack_from("<8I", data, phoff + i * phentsize)
         if p_type == 1:
             uc.mem_write(paddr, data[off:off + filesz])
             end = max(end, paddr + memsz)
-    return entry, end
+    symbols = {}
+    for i in range(shnum):
+        _, sh_type, _, _, off, size, link, _, _, entsize = struct.unpack_from("<10I", data, shoff + i * shentsize)
+        if sh_type != 2:                # SHT_SYMTAB
+            continue
+        stroff = struct.unpack_from("<I", data, shoff + link * shentsize + 16)[0]
+        for pos in range(off, off + size, entsize):
+            name, value = struct.unpack_from("<II", data, pos)
+            symbols[data[stroff + name:data.index(b"\0", stroff + name)].decode()] = value
+    return entry, end, symbols
+
+
+def boot_stub(kernel, entry, end, symbols, magic, mbi):
+    """Run the 32-bit part of boot.S like a Multiboot loader would start it.
+
+    Returns the kernel memory it has prepared and the control registers at
+    the moment the CPU arrives at the first 64-bit instruction."""
+    uc = Uc(UC_ARCH_X86, UC_MODE_32)
+    size = (end - 0x100000 + 0xFFF) & ~0xFFF
+    uc.mem_map(0, 0x100000 + size)
+    load_elf(uc, kernel)
+    uc.reg_write(UC_X86_REG_EAX, magic)
+    uc.reg_write(UC_X86_REG_EBX, mbi)
+    uc.reg_write(UC_X86_REG_CR0, 0x11)          # protected mode, paging off
+    target = symbols["long_mode_entry"]
+    uc.emu_start(entry, target, count=100000)
+    state = {"cr0": uc.reg_read(UC_X86_REG_CR0), "cr3": uc.reg_read(UC_X86_REG_CR3),
+             "cr4": uc.reg_read(UC_X86_REG_CR4), "efer": uc.msr_read(EFER),
+             "gdtr": uc.reg_read(UC_X86_REG_GDTR), "cs": uc.reg_read(UC_X86_REG_CS),
+             "args": (uc.reg_read(UC_X86_REG_EDI), uc.reg_read(UC_X86_REG_ESI))}
+    assert state["cs"] == 0x08 and state["cr0"] & 0x80000001 == 0x80000001 and state["cr4"] & 0x20 \
+        and state["efer"] & 0x500 == 0x500, "boot code did not enter long mode: %r" % state
+    assert state["args"] == (magic, mbi), "boot code lost the Multiboot arguments"
+    return bytes(uc.mem_read(0x100000, size)), state
 
 
 class Machine:
     def __init__(self, kernel, initrd=None, disk=None):
-        self.uc = uc = Uc(UC_ARCH_X86, UC_MODE_32)
+        self.uc = uc = Uc(UC_ARCH_X86, UC_MODE_64)
         uc.mem_map(0, RAM)
         uc.mem_map(LFB, 4 * 1024 * 1024)
         self.serial = bytearray()
@@ -63,6 +106,7 @@ class Machine:
         self.pci_addr = 0
         self.cmos_reg = 0
         self.pending = None
+        self.hung = False
         self.disk = disk                # bytearray with the ATA disk contents, or None
         self.ata = {"regs": [0] * 8, "buf": bytearray(), "status": 0x50, "write": None}
         self.disk_writes = 0
@@ -74,12 +118,23 @@ class Machine:
         self.mouse = [W // 2, H // 2]   # where the kernel believes the pointer is
         self.buttons = 0
 
-        self.pc, kernel_end = load_elf(uc, open(kernel, "rb").read())
-        # the two places where the kernel returns to ring 3 (boot.S, isr.S)
-        for pattern in (b"\x31\xed\xcf", b"\x83\xc4\x08\xcf"):
+        image = open(kernel, "rb").read()
+        entry, kernel_end, symbols = load_elf(uc, image)
+        # 32-bit boot code: builds the page tables and enters long mode
+        memory, boot = boot_stub(image, entry, kernel_end, symbols, 0x2BADB002, MBI)
+        uc.mem_write(0x100000, memory)
+        uc.reg_write(UC_X86_REG_GDTR, boot["gdtr"])
+        uc.reg_write(UC_X86_REG_CR3, boot["cr3"])
+        uc.reg_write(UC_X86_REG_CR4, boot["cr4"])
+        uc.msr_write(EFER, boot["efer"])
+        uc.reg_write(UC_X86_REG_CR0, boot["cr0"])
+        self.pc = symbols["long_mode_entry"]
+        # the two places where the kernel returns to ring 3 (boot.S, isr.S):
+        # `xor %ebp, %ebp; iretq` and `add $16, %rsp; iretq`
+        for pattern in (b"\x31\xed\x48\xcf", b"\x48\x83\xc4\x10\x48\xcf"):
             image = bytes(uc.mem_read(0x100000, kernel_end - 0x100000))
-            assert image.count(pattern) == 1, "cannot find the kernel's iret instructions"
-            addr = 0x100000 + image.index(pattern) + len(pattern) - 1
+            assert image.count(pattern) == 1, "cannot find the kernel's iretq instructions"
+            addr = 0x100000 + image.index(pattern) + len(pattern) - 2
             uc.hook_add(UC_HOOK_CODE, self.watch_iret, None, addr, addr)
         flags, mods = 1, b""
         if initrd:
@@ -90,8 +145,8 @@ class Machine:
             flags |= 8
             mods = struct.pack("<II", 1, MBI + 0x100)
         uc.mem_write(MBI, struct.pack("<IIIII", flags, 640, RAM // 1024 - 1024, 0, 0) + mods)
-        uc.reg_write(UC_X86_REG_EAX, 0x2BADB002)
-        uc.reg_write(UC_X86_REG_EBX, MBI)
+        uc.reg_write(UC_X86_REG_RDI, boot["args"][0])
+        uc.reg_write(UC_X86_REG_RSI, boot["args"][1])
         uc.hook_add(UC_HOOK_INSN, self.port_in, None, 1, 0, UC_X86_INS_IN)
         uc.hook_add(UC_HOOK_INSN, self.port_out, None, 1, 0, UC_X86_INS_OUT)
         uc.hook_add(UC_HOOK_INTR, self.soft_int)
@@ -250,38 +305,37 @@ class Machine:
         self.patch_context(blob, ctx)
 
     def enter_gate(self, vector, return_pc):
-        """Deliver an interrupt/exception like the CPU would; returns the handler."""
+        """Deliver an interrupt/exception like a CPU in long mode; returns the handler."""
         uc = self.uc
         _, base, _, _ = uc.reg_read(UC_X86_REG_IDTR)
-        lo, sel, _, typ, hi = struct.unpack("<HHBBH", uc.mem_read(base + vector * 8, 8))
-        assert typ & 0x8E == 0x8E and sel == 0x08, "bad IDT gate %d" % vector
-        flags = uc.reg_read(UC_X86_REG_EFLAGS)
+        lo, sel, ist, typ, mid, hi, _ = struct.unpack("<HHBBHII", uc.mem_read(base + vector * 16, 16))
+        assert typ & 0x8E == 0x8E and sel == 0x08 and ist == 0, "bad IDT gate %d" % vector
+        flags = uc.reg_read(UC_X86_REG_RFLAGS)
         cs = uc.reg_read(UC_X86_REG_CS)
-        frame = [flags, cs, return_pc]
+        rsp = uc.reg_read(UC_X86_REG_RSP)
+        frame = [uc.reg_read(UC_X86_REG_SS), rsp, flags, cs, return_pc]
         if cs & 3:                      # from ring 3: switch to the kernel stack in the TSS
             assert vector < 48 or typ & 0x60 == 0x60, "int %#x gate is not callable from ring 3" % vector
-            frame = [uc.reg_read(UC_X86_REG_SS), uc.reg_read(UC_X86_REG_ESP)] + frame
             _, gdt, _, _ = uc.reg_read(UC_X86_REG_GDTR)
-            d = uc.mem_read(gdt + 0x28, 8)
-            tss = d[2] | d[3] << 8 | d[4] << 16 | d[7] << 24
-            esp, ss0 = struct.unpack("<II", uc.mem_read(tss + 4, 8))
-            self.to_ring0(sel, ss0)
+            d = uc.mem_read(gdt + 0x28, 16)
+            tss = d[2] | d[3] << 8 | d[4] << 16 | d[7] << 24 | struct.unpack_from("<I", d, 8)[0] << 32
+            rsp = struct.unpack("<Q", uc.mem_read(tss + 4, 8))[0]
+            self.to_ring0(sel, 0x10)
             self.user_entries += 1
-        else:
-            esp = uc.reg_read(UC_X86_REG_ESP)
+        rsp &= ~0xF                     # long mode aligns the stack
         if vector in ERROR_CODE:
             frame.append(4 if cs & 3 else 0)
-        esp -= 4 * len(frame)
-        uc.mem_write(esp, struct.pack("<%dI" % len(frame), *reversed(frame)))
-        uc.reg_write(UC_X86_REG_ESP, esp)
+        rsp -= 8 * len(frame)
+        uc.mem_write(rsp, struct.pack("<%dQ" % len(frame), *reversed(frame)))
+        uc.reg_write(UC_X86_REG_RSP, rsp)
         if typ & 0x0F == 0x0E:          # interrupt gates clear IF, trap gates do not
-            uc.reg_write(UC_X86_REG_EFLAGS, flags & ~0x200)
-        return lo | hi << 16
+            uc.reg_write(UC_X86_REG_RFLAGS, flags & ~0x200)
+        return lo | mid << 16 | hi << 32
 
     def watch_iret(self, uc, address, size, _):
         if self.to_user:                # second visit: let it execute
             self.to_user = False
-        elif struct.unpack("<I", uc.mem_read(uc.reg_read(UC_X86_REG_ESP) + 4, 4))[0] & 3:
+        elif struct.unpack("<Q", uc.mem_read(uc.reg_read(UC_X86_REG_RSP) + 8, 8))[0] & 3:
             self.to_user = True         # restart the run with the user end address
             uc.emu_stop()
 
@@ -297,6 +351,19 @@ class Machine:
 
         If a user program keeps the CPU busy, play the timer: preempt it at the
         end of each time slice and return None after a few slices."""
+        watchdog = threading.Timer(HANG_SECONDS, self.hang)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            return self.run_slices()
+        finally:
+            watchdog.cancel()
+
+    def hang(self):
+        self.hung = True
+        self.uc.emu_stop()
+
+    def run_slices(self):
         busy = 0
         for _ in range(100000):
             self.pending = None
@@ -305,13 +372,20 @@ class Machine:
                 # mapped at the privilege level the CPU stops in; a stray fault
                 # there would turn the next real fault into a double fault.
                 # watch_iret() makes sure a run never crosses from ring 0 to 3.
+                #
+                # Kernel code runs until it halts, with no time limit: a stop
+                # in the middle of an I/O instruction would make Unicorn repeat
+                # it (and e.g. read a word from the disk twice). Only user
+                # code gets time slices; a watchdog catches a stuck kernel.
                 user = self.to_user or self.uc.reg_read(UC_X86_REG_CS) & 3
-                self.uc.emu_start(self.pc, UNTIL_USER if user else UNTIL, timeout=SLICE)
+                self.uc.emu_start(self.pc, UNTIL_USER if user else UNTIL,
+                                  timeout=SLICE if user else 0)
             except UcError as e:
                 if e.errno != UC_ERR_INSN_INVALID:
                     raise
                 self.pending = 6        # #UD
-            eip = self.uc.reg_read(UC_X86_REG_EIP)
+            eip = self.uc.reg_read(UC_X86_REG_RIP)
+            assert not self.hung, "kernel hang at %#x" % eip
             if self.pending is not None:
                 if self.pending < 32:
                     self.clear_fault(self.pending)
@@ -321,7 +395,7 @@ class Machine:
                 continue
             self.pc = eip
             ring3 = self.uc.reg_read(UC_X86_REG_CS) & 3
-            interrupts = bool(self.uc.reg_read(UC_X86_REG_EFLAGS) & 0x200)
+            interrupts = bool(self.uc.reg_read(UC_X86_REG_RFLAGS) & 0x200)
             if not ring3 and self.uc.mem_read(eip - 1, 1)[0] == 0xF4:
                 return interrupts
             if ring3:                   # time slice used up in user mode
@@ -334,7 +408,7 @@ class Machine:
     def irq(self, n):
         mask = self.masks[0x21] if n < 8 else self.masks[0xA1]
         assert not mask & (1 << (n & 7)), "IRQ%d is masked" % n
-        assert self.uc.reg_read(UC_X86_REG_EFLAGS) & 0x200, "interrupts are disabled"
+        assert self.uc.reg_read(UC_X86_REG_RFLAGS) & 0x200, "interrupts are disabled"
         self.pc = self.enter_gate(32 + n, self.pc)
         return self.run()
 
@@ -438,7 +512,7 @@ def disk_test(kernel, initrd, bits, mbr=False, gui=False):
     mkfat, src = fat_tools()
     size = {12: 2, 16: 16, 32: 40}[bits]
     disk = bytearray(mkfat.Builder(size, bits).build(src, mbr=mbr))
-    hello = open(os.path.join(os.path.dirname(kernel) or ".", "rootfs/bin/hello"), "rb").read()
+    hello = open(os.path.join(os.path.dirname(kernel) or ".", "apps/bin/hello"), "rb").read()
     welcome = open(os.path.join(src, "welcome.txt"), "rb").read()
     free0 = mkfat.Volume(bytes(disk)).check()
 
@@ -569,7 +643,7 @@ def disk_full_test(kernel, initrd):
     """A tiny FAT12 volume: fill it up, then make room again."""
     mkfat, src = fat_tools()
     disk = bytearray(mkfat.Builder(bits=12, sectors=400).build(src))
-    hello = open(os.path.join(os.path.dirname(kernel) or ".", "rootfs/bin/hello"), "rb").read()
+    hello = open(os.path.join(os.path.dirname(kernel) or ".", "apps/bin/hello"), "rb").read()
     fit = mkfat.Volume(bytes(disk)).check() // ((len(hello) + 511) // 512 * 512)
     count = fit + 4
     m = Machine(kernel, initrd, disk)
@@ -649,7 +723,8 @@ def main():
         m.type("systest %s\n" % mode)
     expect(m, "malloc: 64 blocks, checksum 2016, reuse ok",
            "bad pointers returned -1 -1 -1",
-           "systest crashed: Page fault (EIP=4", "address 00000000)", "address 00100000)",
+           "systest crashed: Page fault (RIP=00000080", "address 0000000000000000)",
+           "address 0000000000100000)",
            "systest crashed: General protection fault")
     assert "broken" not in m.output()
     assert free_frames() == frames, "page frames leaked"

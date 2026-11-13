@@ -26,7 +26,7 @@ static void banner(void)
           "   \\ V / (_) | |  | ||  __/>  <| |_| |___) |\n"
           "    \\_/ \\___/|_|   \\__\\___/_/\\_\\\\___/|____/\n");
     console_color(VX_LIGHT_GREY, VX_BLACK);
-    kprintf("\nVortexOS %s\n\n", VORTEX_VERSION);
+    kprintf("\nVortexOS %s (x86-64)\n\n", VORTEX_VERSION);
 }
 
 static void status(int good, const char *what)
@@ -38,7 +38,7 @@ static void status(int good, const char *what)
     kprintf(" ] %s\n", what);
 }
 
-void kmain(u32 magic, const struct multiboot_info *mbi)
+void kmain(u64 magic, const struct multiboot_info *mbi)
 {
     vga_init();
     serial_init();
@@ -53,30 +53,32 @@ void kmain(u32 magic, const struct multiboot_info *mbi)
 
     /* The initrd is the first boot module; the heap must start after it. */
     const u8 *initrd = NULL;
-    u32 initrd_len = 0, heap_start = (u32)_kernel_end;
+    u32 initrd_len = 0;
+    u64 heap_start = (u64)_kernel_end;
     if ((mbi->flags & 8) && mbi->mods_count) {
-        const struct multiboot_module *mods = (const struct multiboot_module *)mbi->mods_addr;
-        initrd = (const u8 *)mods[0].start;
+        const struct multiboot_module *mods = (const struct multiboot_module *)(uptr)mbi->mods_addr;
+        initrd = (const u8 *)(uptr)mods[0].start;
         initrd_len = mods[0].end - mods[0].start;
         for (u32 i = 0; i < mbi->mods_count; i++)
             if (mods[i].end > heap_start) heap_start = mods[i].end;
     }
 
     /* Memory map: [kernel + initrd][kernel heap][page frames ............]
-     * The kernel uses at most the first 1 GiB of RAM (identity-mapped). */
-    u32 ram_end = 0x100000 + g_mem_upper_kb * 1024;
-    if (ram_end > KERNEL_LIMIT || ram_end < 0x100000) ram_end = KERNEL_LIMIT;
+     * The kernel uses at most the first 3 GiB of RAM (identity-mapped). */
+    u64 ram_end = 0x100000 + (u64)g_mem_upper_kb * 1024;
+    if (ram_end > KERNEL_LIMIT) ram_end = KERNEL_LIMIT;
     heap_start = (heap_start + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     if (ram_end < heap_start + 24u * 1024 * 1024) panic("not enough memory (32 MiB required)");
-    u32 heap_size = ((ram_end - heap_start) / 2) & ~(PAGE_SIZE - 1);
+    u64 heap_size = ((ram_end - heap_start) / 2) & ~(PAGE_SIZE - 1);
     if (heap_size > 64u * 1024 * 1024) heap_size = 64u * 1024 * 1024;
 
     gdt_init();                             status(1, "GDT, TSS");
     idt_init();                             status(1, "IDT, PIC, system calls");
     heap_init(heap_start, heap_size);
     pmm_init(heap_start + heap_size, ram_end);
-    vmm_init(ram_end, gfx_probe(), GFX_FB_SIZE);
-    status(1, "Paging, heap, page frames");
+    vmm_init();
+    gfx_probe();
+    status(1, "Long mode, 4-level paging, heap, page frames");
     task_init();                            status(1, "Scheduler, user mode");
     timer_init();
     keyboard_init();

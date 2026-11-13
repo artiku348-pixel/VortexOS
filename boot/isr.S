@@ -1,5 +1,8 @@
-/* Interrupt entry stubs: vectors 0-31 are CPU exceptions, 32-47 are IRQ 0-15. */
+/* Interrupt entry stubs (64-bit): vectors 0-31 are CPU exceptions, 32-47 are
+ * IRQ 0-15, 128 is the system call. In long mode the CPU always pushes
+ * SS, RSP, RFLAGS, CS and RIP; the stubs add a uniform frame (struct regs). */
 .altmacro
+.code64
 
 .macro ISR_NOERR n
 isr_stub_\n:
@@ -15,7 +18,7 @@ isr_stub_\n:
 .endm
 
 .macro TABLE_ENTRY n
-    .long isr_stub_\n
+    .quad isr_stub_\n
 .endm
 
 .section .text
@@ -37,25 +40,48 @@ isr_stub_syscall:
     jmp  isr_common
 
 isr_common:
-    pusha
-    push %ds
-    push %es
-    mov  $0x10, %ax
-    mov  %ax, %ds
-    mov  %ax, %es
+    push %rax
+    push %rbx
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %rbp
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %r12
+    push %r13
+    push %r14
+    push %r15
     cld
-    push %esp                           /* struct regs * */
+    mov  %rsp, %rdi                     /* struct regs * */
+    mov  %rsp, %rbp                     /* rbp survives the call */
+    and  $-16, %rsp                     /* the C ABI wants an aligned stack */
     call interrupt_dispatch
-    add  $4, %esp
-    pop  %es
-    pop  %ds
-    popa
-    add  $8, %esp                       /* vector + error code */
-    iret
+    mov  %rbp, %rsp
+    pop  %r15
+    pop  %r14
+    pop  %r13
+    pop  %r12
+    pop  %r11
+    pop  %r10
+    pop  %r9
+    pop  %r8
+    pop  %rbp
+    pop  %rdi
+    pop  %rsi
+    pop  %rdx
+    pop  %rcx
+    pop  %rbx
+    pop  %rax
+    add  $16, %rsp                      /* vector + error code */
+    iretq
 
 .section .rodata
 .global isr_stub_table
-.align 4
+.align 8
 isr_stub_table:
 .set i, 0
 .rept 48

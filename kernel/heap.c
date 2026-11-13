@@ -2,18 +2,19 @@
 #include "kernel.h"
 
 struct block {
-    u32 size;                           /* payload bytes */
-    u32 free;
+    u64 size;                           /* payload bytes */
+    u64 free;
     struct block *next;
+    u64 pad;                            /* keeps payloads 16-byte aligned */
 };
 
-#define ALIGN8(x)    (((x) + 7u) & ~7u)
+#define ALIGN8(x)    (((x) + 15ul) & ~15ul)
 #define HDR          ALIGN8(sizeof(struct block))
 
 static struct block *heap;
-static u32 heap_size;
+static u64 heap_size;
 
-void heap_init(u32 start, u32 size)
+void heap_init(u64 start, u64 size)
 {
     heap = (struct block *)start;
     heap->size = size - HDR;
@@ -28,7 +29,7 @@ void *kmalloc(size_t size)
     size = ALIGN8(size);
     for (struct block *b = heap; b; b = b->next) {
         if (!b->free || b->size < size) continue;
-        if (b->size >= size + HDR + 8) {            /* split the remainder off */
+        if (b->size >= size + HDR + 16) {            /* split the remainder off */
             struct block *rest = (struct block *)((u8 *)b + HDR + size);
             rest->size = b->size - size - HDR;
             rest->free = 1;
@@ -55,10 +56,12 @@ void kfree(void *ptr)
 
 void heap_stats(u32 *total, u32 *used, u32 *blocks)
 {
-    *total = heap_size;
-    *used = *blocks = 0;
+    u64 sum = 0;
+    *total = (u32)(heap_size / 1024);
+    *blocks = 0;
     for (struct block *b = heap; b; b = b->next) {
         (*blocks)++;
-        if (!b->free) *used += b->size;
+        if (!b->free) sum += b->size;
     }
+    *used = (u32)(sum / 1024);
 }

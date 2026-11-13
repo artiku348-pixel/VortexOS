@@ -1,0 +1,5 @@
+# Keep Unix line endings on every platform: the files in rootfs/ and diskfs/
+# go into the OS image as they are.
+* text=auto eol=lf
+*.png binary
+*.img binary

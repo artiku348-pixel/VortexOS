@@ -5,12 +5,12 @@ void kputs(const char *s)
     while (*s) kputc(*s++);
 }
 
-static void put_num(u32 v, u32 base, int width, char pad, int neg)
+static void put_num(u64 v, u32 base, int width, char pad, int neg)
 {
-    char buf[12];
+    char buf[24];
     int n = 0;
     do {
-        u32 d = v % base;
+        u32 d = (u32)(v % base);
         buf[n++] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
         v /= base;
     } while (v);
@@ -20,7 +20,8 @@ static void put_num(u32 v, u32 base, int width, char pad, int neg)
     while (n) kputc(buf[--n]);
 }
 
-/* Supports %c %s %d %u %x %p %% with optional zero-pad / width (e.g. %08x). */
+/* Supports %c %s %d %u %x %p %% with optional zero-pad / width (e.g. %08x)
+ * and the `l` size modifier for 64-bit values (%lu, %ld, %016lx). */
 void kprintf(const char *fmt, ...)
 {
     __builtin_va_list ap;
@@ -32,6 +33,8 @@ void kprintf(const char *fmt, ...)
         fmt++;
         if (*fmt == '0') { pad = '0'; fmt++; }
         while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
+        int wide = 0;
+        while (*fmt == 'l') { wide = 1; fmt++; }
         switch (*fmt) {
         case 'c': kputc((char)__builtin_va_arg(ap, int)); break;
         case 's': {
@@ -42,13 +45,13 @@ void kprintf(const char *fmt, ...)
             break;
         }
         case 'd': {
-            i32 v = __builtin_va_arg(ap, i32);
-            put_num(v < 0 ? 0u - (u32)v : (u32)v, 10, width, pad, v < 0);
+            i64 v = wide ? __builtin_va_arg(ap, i64) : __builtin_va_arg(ap, i32);
+            put_num(v < 0 ? 0ul - (u64)v : (u64)v, 10, width, pad, v < 0);
             break;
         }
-        case 'u': put_num(__builtin_va_arg(ap, u32), 10, width, pad, 0); break;
-        case 'x': put_num(__builtin_va_arg(ap, u32), 16, width, pad, 0); break;
-        case 'p': kputs("0x"); put_num(__builtin_va_arg(ap, u32), 16, 8, '0', 0); break;
+        case 'u': put_num(wide ? __builtin_va_arg(ap, u64) : __builtin_va_arg(ap, u32), 10, width, pad, 0); break;
+        case 'x': put_num(wide ? __builtin_va_arg(ap, u64) : __builtin_va_arg(ap, u32), 16, width, pad, 0); break;
+        case 'p': kputs("0x"); put_num(__builtin_va_arg(ap, u64), 16, 16, '0', 0); break;
         case '%': kputc('%'); break;
         case '\0': fmt--; break;
         default:  kputc('%'); kputc(*fmt);

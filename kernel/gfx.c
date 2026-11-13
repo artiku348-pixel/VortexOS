@@ -46,14 +46,14 @@ static u32 find_framebuffer(void)
 
 static u32 fb_addr;
 
-/* Detect the adapter and locate its framebuffer. Runs once, before paging is
- * enabled, so that the kernel can map the framebuffer into its page tables. */
+/* Detect the adapter and locate its framebuffer. It must lie in the part of
+ * the first 4 GiB that is not RAM: that range is identity-mapped. */
 u32 gfx_probe(void)
 {
     u16 id = bga_read(BGA_ID);
     if (id < 0xB0C0 || id > 0xB0CF) return 0;
     u32 addr = find_framebuffer();
-    if (addr < USER_TOP) return 0;      /* would collide with kernel/user space */
+    if (addr < KERNEL_LIMIT || addr > KERNEL_MAP - GFX_FB_SIZE) return 0;
     fb_addr = addr;
     return addr;
 }
@@ -76,7 +76,7 @@ int gfx_init(void)
         bga_write(BGA_ENABLE, 0);
         return -1;
     }
-    screen.pix = (u32 *)fb_addr;
+    screen.pix = (u32 *)(uptr)fb_addr;
     screen.w = SCREEN_W;
     screen.h = SCREEN_H;
     active = 1;

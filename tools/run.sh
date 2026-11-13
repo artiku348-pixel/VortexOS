@@ -2,12 +2,12 @@
 # Build VortexOS and boot it in QEMU.
 #   tools/run.sh          kernel + initrd directly (fastest)
 #   tools/run.sh iso      bootable ISO through GRUB
-#   tools/run.sh debug    wait for gdb on :1234 (gdb build/vortex.bin -ex 'target remote :1234')
+#   tools/run.sh debug    wait for gdb on :1234 (gdb build/vortex.elf64 -ex 'target remote :1234')
 set -e
 cd "$(dirname "$0")/.."
 
-command -v "${QEMU:-qemu-system-i386}" >/dev/null 2>&1 || {
-    echo "qemu-system-i386 not found. Install QEMU (e.g. 'apt install qemu-system-x86')." >&2
+command -v "${QEMU:-qemu-system-x86_64}" >/dev/null 2>&1 || {
+    echo "qemu-system-x86_64 not found. Install QEMU (e.g. 'apt install qemu-system-x86')." >&2
     exit 1
 }
 case "${1:-}" in

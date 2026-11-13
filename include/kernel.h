@@ -3,13 +3,16 @@
 
 #include <vortex/abi.h>
 
-#define VORTEX_VERSION "0.3.0"
+#define VORTEX_VERSION "0.4.0"
 
 typedef unsigned char  u8;
 typedef unsigned short u16;
 typedef unsigned int   u32;
 typedef signed int     i32;
-typedef u32            size_t;
+typedef unsigned long  u64;             /* x86-64: long and pointers are 64-bit */
+typedef signed long    i64;
+typedef u64            uptr;            /* an address as a number */
+typedef u64            size_t;
 #define NULL ((void *)0)
 
 /* ---- port I/O ---------------------------------------------------------- */
@@ -82,7 +85,7 @@ struct surface {
 extern const u8 font8x16[95][16];
 #define GFX_FB_SIZE (4u * 1024 * 1024)   /* framebuffer bytes mapped by the kernel */
 int  gfx_available(void);               /* Bochs/QEMU VBE adapter present */
-u32  gfx_probe(void);                   /* framebuffer address (0 = none); call before paging */
+u32  gfx_probe(void);                   /* framebuffer address (0 = none) */
 int  gfx_active(void);                  /* graphics mode is on */
 int  gfx_init(void);                    /* switch to 1024x768x32; 0 = ok */
 struct surface *gfx_screen(void);
@@ -129,12 +132,11 @@ void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void panic(const char *msg) __attribute__((noreturn));
 
 /* ---- gdt.c / idt.c ----------------------------------------------------- */
-struct regs {
-    u32 es, ds;
-    u32 edi, esi, ebp, esp, ebx, edx, ecx, eax;
-    u32 int_no, err_code;
-    u32 eip, cs, eflags;
-    u32 user_esp, user_ss;              /* only pushed when coming from ring 3 */
+struct regs {                           /* pushed by isr_common (boot/isr.S) */
+    u64 r15, r14, r13, r12, r11, r10, r9, r8;
+    u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    u64 int_no, err_code;
+    u64 rip, cs, rflags, rsp, ss;       /* pushed by the CPU */
 };
 typedef void (*irq_handler_t)(struct regs *);
 #define SEL_KCODE 0x08
@@ -142,8 +144,9 @@ typedef void (*irq_handler_t)(struct regs *);
 #define SEL_UCODE 0x1B                  /* ring 3 selectors (RPL = 3) */
 #define SEL_UDATA 0x23
 void gdt_init(void);
-void tss_set_kernel_stack(u32 esp0);    /* stack used when ring 3 enters the kernel */
-void enter_user(u32 entry, u32 user_esp) __attribute__((noreturn));
+void tss_set_kernel_stack(u64 rsp0);    /* stack used when ring 3 enters the kernel */
+/* Drop to ring 3 at `entry` as if main-like code was called with (arg1, arg2). */
+void enter_user(u64 entry, u64 user_rsp, u64 arg1, u64 arg2) __attribute__((noreturn));
 void idt_init(void);
 void irq_install(int irq, irq_handler_t handler);
 
@@ -162,36 +165,36 @@ void mouse_init(void);
 int  mouse_poll(struct mouse_packet *p);
 
 /* ---- pmm.c / vmm.c (physical frames, paging) --------------------------- */
-#define PAGE_SIZE    4096u
-#define KERNEL_LIMIT 0x40000000u        /* kernel space: identity-mapped RAM below 1 GiB */
-#define USER_BASE    0x40000000u        /* user space: [USER_BASE, USER_TOP) */
-#define USER_TOP     0x80000000u
-void pmm_init(u32 start, u32 end);
-u32  pmm_alloc(void);                   /* zeroed frame (physical address) or 0 */
-void pmm_free(u32 addr);
+#define PAGE_SIZE    4096ul
+#define KERNEL_LIMIT 0xC0000000ul       /* the kernel uses RAM below 3 GiB (identity-mapped) */
+#define KERNEL_MAP   0x100000000ul      /* identity mapping covers the first 4 GiB */
+#define USER_BASE    0x8000000000ul     /* user space: [USER_BASE, USER_TOP), 512 GiB */
+#define USER_TOP     0x10000000000ul
+void pmm_init(u64 start, u64 end);
+u64  pmm_alloc(void);                   /* zeroed frame (physical address) or 0 */
+void pmm_free(u64 addr);
 void pmm_stats(u32 *total, u32 *free);
-void vmm_init(u32 ram_end, u32 framebuffer, u32 framebuffer_size);
-u32 *vmm_kernel_dir(void);
-u32 *vmm_new_dir(void);
-void vmm_free_dir(u32 *dir);
-void vmm_switch(u32 *dir);              /* NULL = kernel directory */
-int  vmm_alloc(u32 *dir, u32 virt, u32 size);
-int  vmm_copy_to(u32 *dir, u32 virt, const void *src, u32 len);
-int  user_ok(const void *ptr, u32 len);
-int  user_str(const char *s, u32 max);
+void vmm_init(void);
+u64 *vmm_new_space(void);               /* a top-level page table (PML4) */
+void vmm_free_space(u64 *space);
+void vmm_switch(u64 *space);            /* NULL = kernel address space */
+int  vmm_alloc(u64 *space, u64 virt, u64 size);
+int  vmm_copy_to(u64 *space, u64 virt, const void *src, u64 len);
+int  user_ok(const void *ptr, u64 len);
+int  user_str(const char *s, u64 max);
 
 /* ---- heap.c ------------------------------------------------------------ */
-void  heap_init(u32 start, u32 size);
+void  heap_init(u64 start, u64 size);
 void *kmalloc(size_t size);
 void  kfree(void *ptr);
-void  heap_stats(u32 *total, u32 *used, u32 *blocks);
+void  heap_stats(u32 *total_kb, u32 *used_kb, u32 *blocks);
 
 /* ---- task.c (kernel threads and user processes) ------------------------------- */
 #define TASK_MAX 32
 enum { TASK_FREE, TASK_READY, TASK_ZOMBIE };
 struct task {
     int   id, state, exit_code;
-    u32   esp;
+    u64   rsp;
     void *stack;
     char  name[24];
     void (*entry)(void *);
@@ -200,8 +203,8 @@ struct task {
     struct console *own_con;            /* console destroyed with this task */
     struct capture *cap;
     void *allocs;                       /* memory released on exit */
-    u32  *pagedir;                      /* user process: its address space (else NULL) */
-    u32   brk;                          /* user process: end of the heap */
+    u64  *pagedir;                      /* user process: its address space (else NULL) */
+    u64   brk;                          /* user process: end of the heap */
     int   system;                       /* kernel service: cannot be killed */
     char  cwd[VX_PATH_MAX];
 };

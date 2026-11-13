@@ -66,7 +66,7 @@ static int cmd_info(int argc, char **argv)
     memcpy(vendor + 4, &regs[3], 4);
     memcpy(vendor + 8, &regs[2], 4);
     vendor[12] = 0;
-    kprintf("VortexOS %s (i386, built %s)\n", VORTEX_VERSION, __DATE__);
+    kprintf("VortexOS %s (x86-64, built %s)\n", VORTEX_VERSION, __DATE__);
     kprintf("CPU vendor: %s\n", vendor);
     kprintf("Graphics:   %s\n", gfx_active() ? "1024x768x32 framebuffer"
                               : gfx_available() ? "available (run 'desktop')" : "text mode only");
@@ -79,7 +79,7 @@ static int cmd_mem(int argc, char **argv)
     u32 total, used, blocks;
     heap_stats(&total, &used, &blocks);
     kprintf("RAM:  %u KiB lower, %u KiB upper\n", g_mem_lower_kb, g_mem_upper_kb);
-    kprintf("Heap: %u KiB total, %u KiB used, %u block(s)\n", total / 1024, used / 1024, blocks);
+    kprintf("Heap: %u KiB total, %u KiB used, %u block(s)\n", total, used, blocks);
     u32 frames, free;
     pmm_stats(&frames, &free);
     kprintf("Page frames: %u total, %u free (%u KiB free for programs)\n", frames, free, free * 4);
