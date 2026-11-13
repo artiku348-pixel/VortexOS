@@ -54,6 +54,6 @@ void vga_putc(char c)
 
 void vga_init(void)
 {
-    vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+    vga_set_color(VX_LIGHT_GREY, VX_BLACK);
     vga_clear();
 }

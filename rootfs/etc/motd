@@ -1,0 +1,5 @@
+
+Welcome to VortexOS!
+  help      list shell commands        desktop   start the graphical desktop
+  ls /bin   programs and scripts       sysinfo   system summary (a script)
+

@@ -1,4 +1,4 @@
-/* First-fit kernel heap placed right after the kernel image. */
+/* First-fit kernel heap placed right after the kernel image and initrd. */
 #include "kernel.h"
 
 struct block {
@@ -9,24 +9,12 @@ struct block {
 
 #define ALIGN8(x)    (((x) + 7u) & ~7u)
 #define HDR          ALIGN8(sizeof(struct block))
-#define HEAP_MAX     (16u * 1024 * 1024)
-#define HEAP_DEFAULT (1u * 1024 * 1024)
 
-extern char _kernel_end[];
 static struct block *heap;
 static u32 heap_size;
 
-void heap_init(u32 mem_upper_kb)
+void heap_init(u32 start, u32 size)
 {
-    u32 start = ((u32)_kernel_end + 0xFFF) & ~0xFFFu;
-    u32 size = HEAP_DEFAULT;
-
-    if (mem_upper_kb) {                 /* RAM above 1 MiB, as reported by the bootloader */
-        u32 ram_end = 0x100000 + mem_upper_kb * 1024;
-        if (ram_end < start + HEAP_DEFAULT) panic("not enough memory for the heap");
-        size = ram_end - start;
-        if (size > HEAP_MAX) size = HEAP_MAX;
-    }
     heap = (struct block *)start;
     heap->size = size - HDR;
     heap->free = 1;

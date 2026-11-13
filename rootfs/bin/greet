@@ -1,0 +1,6 @@
+# greet NAME -- example script: arguments ($1..$9), variables, redirection.
+set WHO=$1
+echo "Hello, $WHO! I am script $0 and your PATH is $PATH" > /tmp/greeting.txt
+echo "logged a greeting for $WHO" >> /tmp/greet.log
+cat /tmp/greeting.txt
+unset WHO

@@ -56,3 +56,4 @@ dkms.conf
 
 # VortexOS build output
 build/
+__pycache__/

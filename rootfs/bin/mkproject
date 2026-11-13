@@ -1,0 +1,5 @@
+# mkproject NAME -- create a project directory in the current folder.
+mkdir $1
+echo "# $1" > $1/README.txt
+echo "created by $USER" >> $1/README.txt
+ls $1
