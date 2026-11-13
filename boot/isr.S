@@ -29,6 +29,13 @@ isr_stub_\n:
     .set i, i + 1
 .endr
 
+/* System call gate (int $0x80). */
+.global isr_stub_syscall
+isr_stub_syscall:
+    push $0
+    push $128
+    jmp  isr_common
+
 isr_common:
     pusha
     push %ds

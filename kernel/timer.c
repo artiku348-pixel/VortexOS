@@ -24,5 +24,5 @@ void sleep_ms(u32 ms)
 {
     u32 wait = (ms * TIMER_HZ + 999) / 1000;
     u32 start = ticks;
-    while (ticks - start < wait) cpu_hlt();
+    while (ticks - start < wait) task_yield();     /* the idle task halts */
 }

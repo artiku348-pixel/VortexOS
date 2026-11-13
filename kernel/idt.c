@@ -16,6 +16,7 @@ struct table_ptr {
 
 void idt_flush(const struct table_ptr *p);
 extern const u32 isr_stub_table[48];
+void isr_stub_syscall(void);
 
 static struct idt_entry idt[256];
 static struct table_ptr idt_ptr;
@@ -59,10 +60,28 @@ void irq_install(int irq, irq_handler_t handler)
 /* Called from isr_common in boot/isr.S. */
 void interrupt_dispatch(struct regs *r)
 {
+    if (r->int_no == 128) {
+        syscall_dispatch(r);
+        return;
+    }
+
     if (r->int_no < 32) {
         const char *name = exc_names[r->int_no];
+        struct task *t = task_current();
+
+        if (t && t->id > 1) {           /* a faulting task dies; the system lives */
+            t->cap = NULL;
+            console_color(VX_LIGHT_RED, VX_BLACK);
+            kprintf("\n[%d] %s crashed: %s (EIP=%08x)\n", t->id, t->name,
+                    name ? name : "Reserved", r->eip);
+            console_color(VX_LIGHT_GREY, VX_BLACK);
+            task_exit(-1);
+        }
+
         cpu_cli();
-        vga_set_color(VGA_WHITE, VGA_RED);
+        if (t) { t->cap = NULL; t->con = &kcon; }
+        console_emergency();
+        console_color(VX_WHITE, VX_RED);
         kprintf("\n*** CPU EXCEPTION %u: %s (err=%x) ***\n",
                 r->int_no, name ? name : "Reserved", r->err_code);
         kprintf("EIP=%08x CS=%04x EFLAGS=%08x\n", r->eip, r->cs, r->eflags);
@@ -80,16 +99,22 @@ void interrupt_dispatch(struct regs *r)
     }
 }
 
+static void set_gate(int i, u32 addr, u8 type)
+{
+    idt[i].off_low  = (u16)addr;
+    idt[i].selector = 0x08;
+    idt[i].zero     = 0;
+    idt[i].type     = type;
+    idt[i].off_high = (u16)(addr >> 16);
+}
+
 void idt_init(void)
 {
-    for (int i = 0; i < 48; i++) {
-        u32 addr = isr_stub_table[i];
-        idt[i].off_low  = (u16)addr;
-        idt[i].selector = 0x08;
-        idt[i].zero     = 0;
-        idt[i].type     = 0x8E;         /* present, ring 0, 32-bit interrupt gate */
-        idt[i].off_high = (u16)(addr >> 16);
-    }
+    for (int i = 0; i < 48; i++)        /* present, ring 0, 32-bit interrupt gate */
+        set_gate(i, isr_stub_table[i], 0x8E);
+    /* System calls use a trap gate: interrupts stay enabled so that a
+     * blocking call can wait for the timer and the keyboard. */
+    set_gate(128, (u32)isr_stub_syscall, 0x8F);
     idt_ptr.limit = sizeof(idt) - 1;
     idt_ptr.base  = (u32)idt;
     idt_flush(&idt_ptr);
