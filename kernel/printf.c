@@ -1,12 +1,5 @@
 #include "kernel.h"
 
-void kputc(char c)
-{
-    vga_putc(c);
-    if (c == '\n') serial_putc('\r');
-    serial_putc(c);
-}
-
 void kputs(const char *s)
 {
     while (*s) kputc(*s++);
@@ -66,8 +59,11 @@ void kprintf(const char *fmt, ...)
 
 void panic(const char *msg)
 {
+    struct task *t = task_current();
     cpu_cli();
-    vga_set_color(VGA_WHITE, VGA_RED);
+    if (t) { t->cap = NULL; t->con = &kcon; }
+    console_emergency();
+    console_color(VX_WHITE, VX_RED);
     kprintf("\n*** KERNEL PANIC: %s ***\nSystem halted.\n", msg);
     for (;;) cpu_hlt();
 }

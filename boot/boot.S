@@ -50,4 +50,25 @@ idt_flush:
     lidt (%eax)
     ret
 
+/* void switch_context(u32 *old_esp, u32 new_esp)
+ * Saves the callee-saved state of the current task on its stack and resumes
+ * another task (see task_create() for the initial frame layout). */
+.global switch_context
+switch_context:
+    mov  4(%esp), %eax
+    mov  8(%esp), %edx
+    pushf
+    push %ebp
+    push %ebx
+    push %esi
+    push %edi
+    mov  %esp, (%eax)
+    mov  %edx, %esp
+    pop  %edi
+    pop  %esi
+    pop  %ebx
+    pop  %ebp
+    popf
+    ret
+
 .section .note.GNU-stack, "", @progbits

@@ -1,0 +1,8 @@
+# sysinfo -- print a system summary. Scripts are plain lists of commands.
+echo "--- system ---"
+info
+echo "--- memory ---"
+mem
+echo "--- time ---"
+date
+uptime
