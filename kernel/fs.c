@@ -79,6 +79,7 @@ struct fs_node *fs_create(const char *path, int is_dir)
     struct fs_node **tail = &parent->children;      /* keep creation order */
     while (*tail) tail = &(*tail)->next;
     *tail = n;
+    fat_changed(n);
     return n;
 }
 
@@ -97,6 +98,7 @@ int fs_write(struct fs_node *n, const void *data, u32 len, int append)
     }
     memcpy(n->data + off, data, len);
     n->size = need;
+    fat_changed(n);
     return (int)len;
 }
 
@@ -104,12 +106,13 @@ int fs_write(struct fs_node *n, const void *data, u32 len, int append)
 int fs_remove(const char *path)
 {
     struct fs_node *n = fs_lookup(path);
-    if (!n || n == &root) return -1;
+    if (!n || n == &root || fat_is_mount(n)) return -1;
     if (n->is_dir && n->children) return -2;
 
     struct fs_node **link = &n->parent->children;
     while (*link != n) link = &(*link)->next;
     *link = n->next;
+    fat_changed(n->parent);
     kfree(n->data);
     kfree(n);
     return 0;

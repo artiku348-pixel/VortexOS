@@ -73,6 +73,13 @@ char *strcpy(char *dst, const char *src)
     return dst;
 }
 
+char *strrchr(const char *s, int c)
+{
+    const char *last = NULL;
+    do { if (*s == (char)c) last = s; } while (*s++);
+    return (char *)last;
+}
+
 char *strcat(char *dst, const char *src)
 {
     strcpy(dst + strlen(dst), src);

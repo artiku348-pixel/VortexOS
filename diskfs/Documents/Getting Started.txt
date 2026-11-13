@@ -1,0 +1,2 @@
+Long file names with spaces and Mixed Case are stored as VFAT entries.
+You can mount build/disk.img on Linux, macOS or Windows to exchange files.

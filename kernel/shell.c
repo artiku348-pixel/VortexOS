@@ -309,9 +309,32 @@ static int cmd_crash(int argc, char **argv)
     return 0;
 }
 
+static int cmd_sync(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    int r = fat_sync();
+    if (r == -1) kputs("sync: no disk, or write error\n");
+    return r;
+}
+
+static int cmd_disk(int argc, char **argv)
+{
+    u32 total, used, syncs;
+    int pending;
+    (void)argc; (void)argv;
+    fat_info(&total, &used, &syncs, &pending);
+    if (!total) { kputs("No FAT16 disk. Files live in RAM and are lost on reboot.\n"); return 1; }
+    kprintf("ATA disk: %u KiB, FAT16 volume mounted at /disk\n", ata_sectors() / 2);
+    kprintf("Space: %u KiB total, %u KiB used\n", total, used);
+    kprintf("Writes: %u sync(s), %s\n", syncs, pending == 2 ? "DISK FULL, changes not saved"
+            : pending ? "changes waiting to be written" : "everything is saved");
+    return 0;
+}
+
 static int cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    fat_sync();
     kputs("Rebooting...\n");
     cpu_cli();
     for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) { }
@@ -323,6 +346,7 @@ static int cmd_reboot(int argc, char **argv)
 static int cmd_halt(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    fat_sync();
     kputs("System halted. It is now safe to power off.\n");
     cpu_cli();
     for (;;) cpu_hlt();
@@ -358,6 +382,8 @@ static const struct command commands[] = {
     { "color",   "text color <0-15>",          cmd_color },
     { "crash",   "trigger a CPU exception",    cmd_crash },
     { "exit",    "close this shell",           cmd_exit },
+    { "disk",    "disk and /disk usage",       cmd_disk },
+    { "sync",    "write /disk changes now",    cmd_sync },
     { "reboot",  "restart the machine",        cmd_reboot },
     { "halt",    "stop the CPU",               cmd_halt },
     { NULL, NULL, NULL },

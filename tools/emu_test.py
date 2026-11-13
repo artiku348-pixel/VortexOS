@@ -32,7 +32,7 @@ UPPER = "\x00\x00!@#$%^&*()_+\x00\x00QWERTYUIOP{}\n\x00ASDFGHJKL:\"~\x00|ZXCVBNM
 PLAIN = {c: i for i, c in enumerate(LOWER) if c != "\x00"}
 SHIFT = {c: i for i, c in enumerate(UPPER) if c != "\x00" and c != "\n"}
 PLAIN[" "] = 0x39
-EXTENDED = {"UP": 0x48, "DOWN": 0x50, "LEFT": 0x4B, "RIGHT": 0x4D}
+EXTENDED = {"UP": 0x48, "DOWN": 0x50, "LEFT": 0x4B, "RIGHT": 0x4D, "DELETE": 0x53}
 
 
 def load_elf(uc, data):
@@ -50,7 +50,7 @@ def load_elf(uc, data):
 
 
 class Machine:
-    def __init__(self, kernel, initrd=None):
+    def __init__(self, kernel, initrd=None, disk=None):
         self.uc = uc = Uc(UC_ARCH_X86, UC_MODE_32)
         uc.mem_map(0, RAM)
         uc.mem_map(LFB, 4 * 1024 * 1024)
@@ -63,6 +63,9 @@ class Machine:
         self.pci_addr = 0
         self.cmos_reg = 0
         self.pending = None
+        self.disk = disk                # bytearray with the ATA disk contents, or None
+        self.ata = {"regs": [0] * 8, "buf": bytearray(), "status": 0x50, "write": None}
+        self.disk_writes = 0
         self.seg_off = None
         self.fault_off = None
         self.fresh = bytes(uc.context_save())
@@ -94,7 +97,62 @@ class Machine:
         uc.hook_add(UC_HOOK_INTR, self.soft_int)
 
     # ---- devices ---------------------------------------------------------
+    # ---- ATA disk (primary master, PIO, LBA28) ---------------------------
+    def ata_lba(self):
+        r = self.ata["regs"]
+        return r[3] | r[4] << 8 | r[5] << 16 | (r[6] & 0x0F) << 24
+
+    def ata_command(self, cmd):
+        a = self.ata
+        a["status"] = 0x50              # ready
+        if cmd == 0xEC:                 # IDENTIFY DEVICE
+            ident = [0] * 256
+            ident[49] = 0x0200          # LBA supported
+            ident[60], ident[61] = (len(self.disk) // 512) & 0xFFFF, (len(self.disk) // 512) >> 16
+            a["buf"] = bytearray(struct.pack("<256H", *ident))
+            a["status"] = 0x58          # ready + data request
+        elif cmd in (0x20, 0x30):
+            lba = self.ata_lba()
+            assert a["regs"][2] == 1 and a["regs"][6] & 0x40, "driver must use LBA, 1 sector"
+            if lba * 512 >= len(self.disk):
+                a["status"] = 0x51      # error
+            elif cmd == 0x20:
+                a["buf"] = bytearray(self.disk[lba * 512:lba * 512 + 512])
+                a["status"] = 0x58
+            else:
+                a["buf"], a["write"] = bytearray(), lba
+                a["status"] = 0x58
+        elif cmd != 0xE7:               # FLUSH CACHE needs nothing
+            a["status"] = 0x51
+
+    def ata_in(self, port, size):
+        a = self.ata
+        if port == 0x1F0:
+            assert size == 2 and a["status"] & 8 and a["write"] is None, "unexpected ATA data read"
+            value = a["buf"][0] | a["buf"][1] << 8
+            del a["buf"][:2]
+            if not a["buf"]:
+                a["status"] = 0x50
+            return value
+        return a["status"] if port in (0x1F7, 0x3F6) else a["regs"][port - 0x1F0]
+
+    def ata_out(self, port, size, value):
+        a = self.ata
+        if port == 0x1F0:
+            assert size == 2 and a["write"] is not None, "unexpected ATA data write"
+            a["buf"] += struct.pack("<H", value & 0xFFFF)
+            if len(a["buf"]) == 512:
+                self.disk[a["write"] * 512:a["write"] * 512 + 512] = a["buf"]
+                a["buf"], a["write"], a["status"] = bytearray(), None, 0x50
+                self.disk_writes += 1
+        elif port == 0x1F7:
+            self.ata_command(value & 0xFF)
+        elif port != 0x3F6:
+            a["regs"][port - 0x1F0] = value & 0xFF
+
     def port_in(self, uc, port, size, _):
+        if self.disk is not None and (0x1F0 <= port <= 0x1F7 or port == 0x3F6):
+            return self.ata_in(port, size)
         if port == 0x60:
             return self.ps2.pop(0) if self.ps2 else 0
         if port == 0x64:
@@ -115,6 +173,8 @@ class Machine:
         return self.masks.get(port, 0)
 
     def port_out(self, uc, port, size, value, _):
+        if self.disk is not None and (0x1F0 <= port <= 0x1F7 or port == 0x3F6):
+            return self.ata_out(port, size, value)
         if port == 0x3FB:
             self.dlab = bool(value & 0x80)
         elif port == 0x3F8 and not self.dlab:
@@ -359,6 +419,78 @@ def expect(m, *needles):
         assert needle in out, "missing %r in output:\n%s" % (needle, out[-2000:])
 
 
+def disk_test(kernel, initrd):
+    """FAT16 disk: mount, read, write back, check with an independent reader, reboot."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import mkfat
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "diskfs")
+    disk = bytearray(mkfat.Builder(16).build(src))
+    hello = open(os.path.join(os.path.dirname(kernel) or ".", "rootfs/bin/hello"), "rb").read()
+
+    m = Machine(kernel, initrd, disk)
+    assert m.run(), m.text_screen()
+    expect(m, "Disk: FAT16 volume", "mounted at /disk")
+    assert m.disk_writes == 0, "mounting must not write to the disk"
+    for cmd in ("ls /disk", "cat /disk/welcome.txt", "ls /disk/Documents", "ps",
+                "echo persistent data > /disk/saved.txt", "mkdir /disk/Projects",
+                "echo long names work > /disk/Projects/MixedCase-LongFileName.text",
+                "cp /bin/hello /disk/hello", "rm /disk/scripts/backup", "disk"):
+        m.type(cmd + "\n")
+    expect(m, "This file lives on the FAT16 disk", "Getting Started.txt", "kernel  diskd",
+           "changes waiting to be written")
+    assert m.disk_writes == 0, "writes should be deferred"
+    m.tick(150)                         # the diskd thread syncs after a quiet moment
+    assert m.disk_writes > 0, "diskd did not write the changes"
+    m.type("disk\n")
+    expect(m, "everything is saved")
+
+    tree = mkfat.read_tree(bytes(disk))  # independent FAT16 reader
+    assert tree["/saved.txt"] == b"persistent data\n", tree.get("/saved.txt")
+    assert tree["/Projects/MixedCase-LongFileName.text"] == b"long names work\n"
+    assert tree["/hello"] == hello and len(hello) > 4096, "multi-cluster file is damaged"
+    assert tree["/Documents/Getting Started.txt"].startswith(b"Long file names")
+    assert "/scripts/backup" not in tree and tree["/scripts"] is None
+    assert tree["/welcome.txt"] == open(os.path.join(src, "welcome.txt"), "rb").read()
+
+    writes = m.disk_writes              # explicit `sync`
+    m.type("echo second > /disk/saved.txt\nsync\n")
+    assert m.disk_writes > writes
+    assert mkfat.read_tree(bytes(disk))["/saved.txt"] == b"second\n"
+    print(m.text_screen())
+
+    m = Machine(kernel, initrd, disk)   # "reboot": a new machine with the same disk
+    assert m.run(), m.text_screen()
+    for cmd in ("cat /disk/saved.txt", "cat /disk/Projects/MixedCase-LongFileName.text",
+                "ls /disk/scripts", "/disk/hello from disk", "kill 2", "ps"):
+        m.type(cmd + "\n")
+    expect(m, "\nsecond\n", "\nlong names work\n", "Hello from a VortexOS application!",
+           "Arguments: [from] [disk]", "kernel  diskd")
+    assert "backup" not in m.output()
+    assert m.disk_writes == 0
+    print(m.text_screen())
+
+    # File manager on the desktop: browse /disk, view a file, delete it.
+    shots = os.path.dirname(kernel) or "."
+    m.type("desktop\n")
+    m.tick(2)
+    m.type("files /disk &\n")
+    m.tick(2)
+    m.screenshot(shots + "/08-files.png")
+    for _ in range(6):
+        m.key("DOWN")                   # the last entry: welcome.txt
+    m.type("\n")                        # open it in the viewer
+    m.tick(2)
+    m.screenshot(shots + "/09-files-view.png")
+    assert "/welcome.txt" in mkfat.read_tree(bytes(disk))
+    m.key("LEFT")                       # back to the list
+    m.key("DELETE")
+    m.tick(150)
+    after = mkfat.read_tree(bytes(disk))
+    assert "/welcome.txt" not in after and after["/saved.txt"] == b"second\n", sorted(after)
+    print("\n--- disk OK (%d files on the FAT16 volume) ---"
+          % sum(v is not None for v in tree.values()))
+
+
 def main():
     kernel = sys.argv[1] if len(sys.argv) > 1 else "build/vortex.bin"
     initrd = sys.argv[2] if len(sys.argv) > 2 else "build/initrd.tar"
@@ -508,6 +640,7 @@ def main():
     m.screenshot(shots + "/07-panic.png")
     print(m.output()[mark:])
     print("--- desktop OK, screenshots in %s ---" % shots)
+    disk_test(kernel, initrd)
     print("\nPASS")
 
 

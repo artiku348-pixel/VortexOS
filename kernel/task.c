@@ -171,7 +171,7 @@ int task_alive(int id) { return find(id) != NULL; }
 int task_kill(int id)
 {
     struct task *t = find(id);
-    if (!t || id <= 1) return -1;       /* kernel and idle tasks are immortal */
+    if (!t || id <= 1 || t->system) return -1;       /* kernel and idle tasks are immortal */
     if (t == cur) task_exit(-1);
     cleanup(t);
     kfree(t->stack);

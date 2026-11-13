@@ -186,7 +186,7 @@ void *kmalloc(size_t size);
 void  kfree(void *ptr);
 void  heap_stats(u32 *total, u32 *used, u32 *blocks);
 
-/* ---- task.c (cooperative kernel threads) ------------------------------- */
+/* ---- task.c (kernel threads and user processes) ------------------------------- */
 #define TASK_MAX 32
 enum { TASK_FREE, TASK_READY, TASK_ZOMBIE };
 struct task {
@@ -202,6 +202,7 @@ struct task {
     void *allocs;                       /* memory released on exit */
     u32  *pagedir;                      /* user process: its address space (else NULL) */
     u32   brk;                          /* user process: end of the heap */
+    int   system;                       /* kernel service: cannot be killed */
     char  cwd[VX_PATH_MAX];
 };
 void  task_init(void);
@@ -226,6 +227,18 @@ struct fs_node {
     struct fs_node *parent, *children, *next;
 };
 void fs_init(void);
+
+/* ---- ata.c / fat.c (FAT16 disk mounted at /disk) ----------------------- */
+u32  ata_init(void);                            /* sectors, 0 = no disk */
+u32  ata_sectors(void);
+int  ata_read(u32 lba, void *buf);              /* one 512-byte sector */
+int  ata_write(u32 lba, const void *buf);
+int  ata_flush(void);
+u32  fat_mount(void);                           /* volume size in KiB, 0 = none */
+int  fat_sync(void);
+void fat_changed(const struct fs_node *n);
+int  fat_is_mount(const struct fs_node *n);
+void fat_info(u32 *total_kb, u32 *used_kb, u32 *syncs, int *pending);
 int  fs_load_tar(const u8 *tar, u32 len);       /* returns number of files */
 struct fs_node *fs_lookup(const char *path);    /* relative to the task's cwd */
 struct fs_node *fs_create(const char *path, int is_dir);

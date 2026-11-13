@@ -9,7 +9,8 @@ KERNEL  := $(BUILD)/vortex.bin
 INITRD  := $(BUILD)/initrd.tar
 ISO     := $(BUILD)/vortex.iso
 QEMU    ?= qemu-system-i386
-QEMUFLAGS ?= -m 128 -vga std -serial stdio
+DISK    := $(BUILD)/disk.img
+QEMUFLAGS ?= -m 128 -vga std -serial stdio -drive file=$(DISK),format=raw,if=ide,index=0
 
 # ---- kernel ---------------------------------------------------------------
 CFLAGS  := -m32 -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fno-builtin \
@@ -38,8 +39,8 @@ APP_ELFS := $(patsubst %,$(BUILD)/apps/bin/%,$(BIN_APPS)) \
             $(patsubst %,$(BUILD)/apps/gui/%,$(GUI_APPS))
 ROOTFS_FILES := $(shell find rootfs -type f)
 
-.PHONY: all apps run iso run-iso test clean FORCE
-all: $(KERNEL) $(INITRD)
+.PHONY: all apps run iso run-iso test clean FORCE disk
+all: $(KERNEL) $(INITRD) $(DISK)
 FORCE:
 apps: $(APP_ELFS)
 
@@ -78,8 +79,19 @@ $(INITRD): $(APP_ELFS) $(ROOTFS_FILES) FORCE
 	$(if $(GUI_APPS),cp $(patsubst %,$(BUILD)/apps/gui/%,$(GUI_APPS)) $(BUILD)/rootfs/apps/)
 	tar --format=ustar --owner=0 --group=0 -cf $@ -C $(BUILD)/rootfs .
 
+# The hard disk: a 16 MiB FAT16 image seeded from diskfs/ and mounted at
+# /disk. It is created only once, so files saved by the OS are kept between
+# runs; `make disk` starts over with a fresh image.
+$(DISK):
+	@mkdir -p $(BUILD)
+	python3 tools/mkfat.py create $@ diskfs 16
+
+disk:
+	@mkdir -p $(BUILD)
+	python3 tools/mkfat.py create $(DISK) diskfs 16
+
 # Boot directly in QEMU (it understands Multiboot kernels and modules).
-run: $(KERNEL) $(INITRD)
+run: $(KERNEL) $(INITRD) $(DISK)
 	$(QEMU) -kernel $(KERNEL) -initrd $(INITRD) $(QEMUFLAGS)
 
 # Bootable CD image (needs grub-mkrescue + xorriso).
@@ -91,7 +103,7 @@ $(ISO): $(KERNEL) $(INITRD) boot/grub.cfg
 	cp boot/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(BUILD)/iso
 
-run-iso: $(ISO)
+run-iso: $(ISO) $(DISK)
 	$(QEMU) -cdrom $(ISO) $(QEMUFLAGS)
 
 # Smoke test without QEMU: boots the kernel in the Unicorn CPU emulator

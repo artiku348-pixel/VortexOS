@@ -1,0 +1,5 @@
+This file lives on the FAT16 disk (build/disk.img), not in the initrd.
+Everything under /disk survives a reboot: try
+    echo hello > /disk/test.txt
+    reboot
+    cat /disk/test.txt
