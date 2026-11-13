@@ -247,6 +247,7 @@ static void build_menu(void)
     nitems = 0;
     add_item("Terminal", "", ACT_TERMINAL);
     struct fs_node *dir = fs_lookup("/apps");
+    if (fs_open(dir)) dir = NULL;
     for (struct fs_node *n = dir ? dir->children : NULL; n; n = n->next) {
         char label[24], path[VX_PATH_MAX];
         if (!exec_is_elf(n) || nitems >= MENU_MAX - 1) continue;

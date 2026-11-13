@@ -20,9 +20,9 @@ enum { DT_NULL = 0, DT_REL = 17, DT_RELSZ = 18, R_386_NONE = 0, R_386_RELATIVE =
 
 struct app_start { u32 entry, esp; };
 
-int exec_is_elf(const struct fs_node *n)
+int exec_is_elf(struct fs_node *n)
 {
-    return n && !n->is_dir && n->size >= sizeof(struct elf_hdr) &&
+    return n && !n->is_dir && n->size >= sizeof(struct elf_hdr) && fs_open(n) == 0 &&
            memcmp(n->data, "\x7f" "ELF", 4) == 0;
 }
 

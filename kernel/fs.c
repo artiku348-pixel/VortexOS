@@ -1,5 +1,7 @@
-/* ramfs: a small in-memory tree filesystem. Its initial contents come from
- * the initrd, a ustar archive passed by the bootloader as a module. */
+/* The file tree. Nodes outside /disk live only in memory (their initial
+ * contents come from the initrd, a ustar archive passed by the bootloader).
+ * Nodes below /disk mirror the FAT volume: fat.c fills them in on demand
+ * (fs_open) and is told about every change. */
 #include "kernel.h"
 
 static struct fs_node root = { .name = "", .is_dir = 1 };
@@ -13,10 +15,25 @@ void fs_init(void)
     fs_create("/tmp", 1);
 }
 
+int fs_open(struct fs_node *n)
+{
+    if (!n) return -1;
+    if ((n->fat_flags & (FAT_ON_DISK | FAT_LOADED)) == FAT_ON_DISK) return fat_load(n);
+    return 0;
+}
+
+static int lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+
 static struct fs_node *child(struct fs_node *dir, const char *name, size_t len)
 {
-    for (struct fs_node *n = dir->children; n; n = n->next)
-        if (strlen(n->name) == len && strncmp(n->name, name, len) == 0) return n;
+    int nocase = dir->fat_flags & FAT_ON_DISK;      /* FAT names ignore case */
+    if (fs_open(dir)) return NULL;
+    for (struct fs_node *n = dir->children; n; n = n->next) {
+        if (strlen(n->name) != len) continue;
+        size_t i = 0;
+        while (i < len && (nocase ? lower(n->name[i]) == lower(name[i]) : n->name[i] == name[i])) i++;
+        if (i == len) return n;
+    }
     return NULL;
 }
 
@@ -45,6 +62,29 @@ struct fs_node *fs_lookup(const char *path)
     return walk(from, path);
 }
 
+/* Append a new node to `parent` (no checks: see fs_create). */
+struct fs_node *fs_node_new(struct fs_node *parent, const char *name, int is_dir)
+{
+    struct fs_node *n = kmalloc(sizeof(*n));
+    if (!n) return NULL;
+    memset(n, 0, sizeof(*n));
+    strlcpy(n->name, name, sizeof(n->name));
+    n->is_dir = !!is_dir;
+    n->parent = parent;
+
+    struct fs_node **tail = &parent->children;      /* keep creation order */
+    while (*tail) tail = &(*tail)->next;
+    *tail = n;
+    return n;
+}
+
+static void unlink(struct fs_node *n)
+{
+    struct fs_node **link = &n->parent->children;
+    while (*link != n) link = &(*link)->next;
+    *link = n->next;
+}
+
 struct fs_node *fs_create(const char *path, int is_dir)
 {
     char dir[VX_PATH_MAX];
@@ -69,23 +109,20 @@ struct fs_node *fs_create(const char *path, int is_dir)
     struct fs_node *n = child(parent, name, len);
     if (n) return n->is_dir == !!is_dir ? n : NULL;
 
-    n = kmalloc(sizeof(*n));
-    if (!n) return NULL;
-    memset(n, 0, sizeof(*n));
-    strcpy(n->name, name);
-    n->is_dir = !!is_dir;
-    n->parent = parent;
-
-    struct fs_node **tail = &parent->children;      /* keep creation order */
-    while (*tail) tail = &(*tail)->next;
-    *tail = n;
-    fat_changed(n);
+    if ((parent->fat_flags & FAT_ON_DISK) && fs_open(parent)) return NULL;
+    n = fs_node_new(parent, name, is_dir);
+    if (n && (parent->fat_flags & FAT_ON_DISK) && fat_create(n)) {
+        unlink(n);                                  /* no room on the volume, bad name... */
+        kfree(n);
+        return NULL;
+    }
     return n;
 }
 
 int fs_write(struct fs_node *n, const void *data, u32 len, int append)
 {
     if (!n || n->is_dir) return -1;
+    if (append && fs_open(n)) return -1;            /* need the old contents */
     u32 off = append ? n->size : 0;
     u32 need = off + len;
     if (need > n->cap) {
@@ -98,7 +135,7 @@ int fs_write(struct fs_node *n, const void *data, u32 len, int append)
     }
     memcpy(n->data + off, data, len);
     n->size = need;
-    fat_changed(n);
+    if (n->fat_flags & FAT_ON_DISK) fat_dirty(n);
     return (int)len;
 }
 
@@ -107,12 +144,10 @@ int fs_remove(const char *path)
 {
     struct fs_node *n = fs_lookup(path);
     if (!n || n == &root || fat_is_mount(n)) return -1;
-    if (n->is_dir && n->children) return -2;
+    if (n->is_dir && (fs_open(n) || n->children)) return -2;
+    if ((n->fat_flags & FAT_ON_DISK) && fat_remove(n)) return -1;
 
-    struct fs_node **link = &n->parent->children;
-    while (*link != n) link = &(*link)->next;
-    *link = n->next;
-    fat_changed(n->parent);
+    unlink(n);
     kfree(n->data);
     kfree(n);
     return 0;

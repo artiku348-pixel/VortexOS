@@ -419,76 +419,180 @@ def expect(m, *needles):
         assert needle in out, "missing %r in output:\n%s" % (needle, out[-2000:])
 
 
-def disk_test(kernel, initrd):
-    """FAT16 disk: mount, read, write back, check with an independent reader, reboot."""
+def fat_tools():
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import mkfat
-    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "diskfs")
-    disk = bytearray(mkfat.Builder(16).build(src))
+    return mkfat, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "diskfs")
+
+
+def settle(m):
+    """Let the diskd thread write everything out."""
+    m.tick(150)
+    mark = len(m.output())
+    m.type("disk\n")
+    assert "everything is saved" in m.output()[mark:], m.output()[mark:]
+
+
+def disk_test(kernel, initrd, bits, mbr=False, gui=False):
+    """FAT volume: mount, read, change, verify with an independent reader, reboot."""
+    mkfat, src = fat_tools()
+    size = {12: 2, 16: 16, 32: 40}[bits]
+    disk = bytearray(mkfat.Builder(size, bits).build(src, mbr=mbr))
     hello = open(os.path.join(os.path.dirname(kernel) or ".", "rootfs/bin/hello"), "rb").read()
+    welcome = open(os.path.join(src, "welcome.txt"), "rb").read()
+    free0 = mkfat.Volume(bytes(disk)).check()
 
     m = Machine(kernel, initrd, disk)
     assert m.run(), m.text_screen()
-    expect(m, "Disk: FAT16 volume", "mounted at /disk")
+    expect(m, "Disk: FAT%d volume" % bits, "mounted at /disk")
     assert m.disk_writes == 0, "mounting must not write to the disk"
-    for cmd in ("ls /disk", "cat /disk/welcome.txt", "ls /disk/Documents", "ps",
+    for cmd in ("ls /disk", "cat /disk/welcome.txt", "ls /disk/Documents", "ps", "disk",
                 "echo persistent data > /disk/saved.txt", "mkdir /disk/Projects",
                 "echo long names work > /disk/Projects/MixedCase-LongFileName.text",
                 "cp /bin/hello /disk/hello", "rm /disk/scripts/backup", "disk"):
         m.type(cmd + "\n")
-    expect(m, "This file lives on the FAT16 disk", "Getting Started.txt", "kernel  diskd",
-           "changes waiting to be written")
+    expect(m, "This file lives on the FAT disk", "Getting Started.txt", "kernel  diskd",
+           "Volume: FAT%d" % bits, "everything is saved", "changes waiting to be written")
+    if mbr:
+        expect(m, "partition at sector %d" % mkfat.MBR_START)
     assert m.disk_writes == 0, "writes should be deferred"
-    m.tick(150)                         # the diskd thread syncs after a quiet moment
+    settle(m)                           # the diskd thread syncs after a quiet moment
     assert m.disk_writes > 0, "diskd did not write the changes"
-    m.type("disk\n")
-    expect(m, "everything is saved")
 
-    tree = mkfat.read_tree(bytes(disk))  # independent FAT16 reader
+    tree = mkfat.read_tree(bytes(disk))  # independent reader + consistency check
     assert tree["/saved.txt"] == b"persistent data\n", tree.get("/saved.txt")
     assert tree["/Projects/MixedCase-LongFileName.text"] == b"long names work\n"
     assert tree["/hello"] == hello and len(hello) > 4096, "multi-cluster file is damaged"
     assert tree["/Documents/Getting Started.txt"].startswith(b"Long file names")
     assert "/scripts/backup" not in tree and tree["/scripts"] is None
-    assert tree["/welcome.txt"] == open(os.path.join(src, "welcome.txt"), "rb").read()
+    assert tree["/welcome.txt"] == welcome
 
-    writes = m.disk_writes              # explicit `sync`
+    # Only what changed is written: one small file must not rewrite the volume.
+    writes = m.disk_writes
     m.type("echo second > /disk/saved.txt\nsync\n")
-    assert m.disk_writes > writes
+    assert 0 < m.disk_writes - writes <= 4, "sync wrote %d sectors" % (m.disk_writes - writes)
     assert mkfat.read_tree(bytes(disk))["/saved.txt"] == b"second\n"
+
+    # Many long names: the directory has to grow; then free and reuse entries.
+    names = ["long-file-name-number-%02d.txt" % i for i in range(40)]
+    for name in names:
+        m.type("touch /disk/Projects/%s\n" % name)
+    for name in names[::2]:
+        m.type("rm /disk/Projects/%s\n" % name)
+    for cmd in ("echo reused > /disk/Projects/x.txt",
+                "echo reused slots > /disk/Projects/A-Name-That-Needs-Three-Entries.txt",
+                "echo more >> /disk/saved.txt",             # append
+                "echo tiny > /disk/hello",                  # shrink: clusters are freed
+                "cp /bin/hello /disk/Projects/hello.elf",
+                "rm /disk/scripts",                         # remove an (empty) directory
+                "mkdir /disk/Projects/sub", "mkdir /disk/Projects/sub/deeper",
+                "echo deep > /disk/Projects/sub/deeper/file.txt",
+                "cat /disk/SAVED.TXT",                      # names ignore case
+                "echo same file >> /disk/Saved.Txt",
+                "echo bad > /disk/what?.txt",               # not allowed on FAT
+                "ls /disk/Projects"):
+        m.type(cmd + "\n")
+    settle(m)
+    expect(m, "\nsecond\nmore\n")
+    volume = mkfat.Volume(bytes(disk))
+    free1 = volume.check()
+    tree = volume.tree
+    expected = {"/Documents": None, "/Projects": None, "/Projects/sub": None,
+                "/Projects/sub/deeper": None,
+                "/Documents/Getting Started.txt": tree["/Documents/Getting Started.txt"],
+                "/welcome.txt": welcome, "/saved.txt": b"second\nmore\nsame file\n",
+                "/hello": b"tiny\n", "/Projects/hello.elf": hello,
+                "/Projects/MixedCase-LongFileName.text": b"long names work\n",
+                "/Projects/x.txt": b"reused\n",
+                "/Projects/A-Name-That-Needs-Three-Entries.txt": b"reused slots\n",
+                "/Projects/sub/deeper/file.txt": b"deep\n"}
+    expected.update({"/Projects/" + name: b"" for name in names[1::2]})
+    assert tree == expected, sorted(set(tree) ^ set(expected))
+    cluster = volume.spc * 512
+    assert free0 - free1 < len(hello) + 24 * cluster, "space was not freed: %d" % (free0 - free1)
+    try:                                # a third opinion, if pyfatfs is installed
+        from pyfatfs.PyFatFS import PyFatFS
+        import tempfile
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(disk)
+            f.flush()
+            other = PyFatFS(f.name, read_only=True, offset=volume.base * 512)
+            assert other.fs.fat_type == bits
+            assert other.readbytes("/Projects/HELLO.ELF") == hello
+            assert other.readbytes("/Projects/SUB/DEEPER/FILE.TXT") == b"deep\n"
+            assert len(other.listdir("/Projects")) == 25
+            other.close()
+        third = ", pyfatfs agrees"
+    except ImportError:
+        third = ""
     print(m.text_screen())
 
     m = Machine(kernel, initrd, disk)   # "reboot": a new machine with the same disk
     assert m.run(), m.text_screen()
+    mark = len(m.output())
     for cmd in ("cat /disk/saved.txt", "cat /disk/Projects/MixedCase-LongFileName.text",
-                "ls /disk/scripts", "/disk/hello from disk", "kill 2", "ps"):
+                "ls /disk/Projects", "cat /disk/Projects/sub/deeper/file.txt",
+                "/disk/Projects/hello.elf from disk", "kill 2", "ps"):
         m.type(cmd + "\n")
-    expect(m, "\nsecond\n", "\nlong names work\n", "Hello from a VortexOS application!",
-           "Arguments: [from] [disk]", "kernel  diskd")
-    assert "backup" not in m.output()
-    assert m.disk_writes == 0
+    out = m.output()[mark:]
+    for needle in ("\nsecond\nmore\nsame file\n", "\nlong names work\n", "\ndeep\n",
+                   "long-file-name-number-39.txt", "A-Name-That-Needs-Three-Entries.txt",
+                   "Hello from a VortexOS application!", "Arguments: [from] [disk]",
+                   "kernel  diskd"):
+        assert needle in out, "missing %r in:\n%s" % (needle, out)
+    assert "long-file-name-number-38.txt" not in out
+    assert m.disk_writes == 0, "reading must not write"
     print(m.text_screen())
 
-    # File manager on the desktop: browse /disk, view a file, delete it.
-    shots = os.path.dirname(kernel) or "."
-    m.type("desktop\n")
-    m.tick(2)
-    m.type("files /disk &\n")
-    m.tick(2)
-    m.screenshot(shots + "/08-files.png")
-    for _ in range(6):
-        m.key("DOWN")                   # the last entry: welcome.txt
-    m.type("\n")                        # open it in the viewer
-    m.tick(2)
-    m.screenshot(shots + "/09-files-view.png")
-    assert "/welcome.txt" in mkfat.read_tree(bytes(disk))
-    m.key("LEFT")                       # back to the list
-    m.key("DELETE")
+    if gui:     # File manager on the desktop: browse /disk, view a file, delete it.
+        shots = os.path.dirname(kernel) or "."
+        m.type("desktop\n")
+        m.tick(2)
+        m.type("files /disk &\n")
+        m.tick(2)
+        m.screenshot(shots + "/08-files.png")
+        for _ in range(6):
+            m.key("DOWN")               # the last entry: welcome.txt
+        m.type("\n")                    # open it in the viewer
+        m.tick(2)
+        m.screenshot(shots + "/09-files-view.png")
+        m.key("LEFT")                   # back to the list
+        m.key("DELETE")
+        m.tick(150)
+        after = mkfat.read_tree(bytes(disk))
+        assert "/welcome.txt" not in after and "/saved.txt" in after, sorted(after)
+    print("\n--- FAT%d%s OK: %d entries verified by an independent reader%s ---\n"
+          % (bits, " in an MBR partition" if mbr else "", len(tree), third))
+
+
+def disk_full_test(kernel, initrd):
+    """A tiny FAT12 volume: fill it up, then make room again."""
+    mkfat, src = fat_tools()
+    disk = bytearray(mkfat.Builder(bits=12, sectors=400).build(src))
+    hello = open(os.path.join(os.path.dirname(kernel) or ".", "rootfs/bin/hello"), "rb").read()
+    fit = mkfat.Volume(bytes(disk)).check() // ((len(hello) + 511) // 512 * 512)
+    count = fit + 4
+    m = Machine(kernel, initrd, disk)
+    assert m.run(), m.text_screen()
+    for i in range(count):
+        m.type("cp /bin/hello /disk/h%02d\n" % i)
     m.tick(150)
-    after = mkfat.read_tree(bytes(disk))
-    assert "/welcome.txt" not in after and after["/saved.txt"] == b"second\n", sorted(after)
-    print("\n--- disk OK (%d files on the FAT16 volume) ---"
-          % sum(v is not None for v in tree.values()))
+    m.type("disk\n")
+    expect(m, "no space left on /disk", "DISK FULL")
+    volume = mkfat.Volume(bytes(disk))  # still a consistent volume
+    volume.check()
+    saved = [p for p, data in volume.tree.items() if data == hello]
+    assert len(saved) == fit, "%d files saved, %d fit" % (len(saved), fit)
+
+    for i in range(8):                  # free some space: the rest gets written
+        m.type("rm /disk/h%02d\n" % i)
+    settle(m)
+    volume = mkfat.Volume(bytes(disk))
+    volume.check()
+    assert sorted(p for p, data in volume.tree.items() if data == hello) == \
+        ["/h%02d" % i for i in range(8, count)]
+    print(m.text_screen())
+    print("\n--- disk full OK (%d files fit, %d copied) ---\n" % (fit, count))
 
 
 def main():
@@ -640,7 +744,10 @@ def main():
     m.screenshot(shots + "/07-panic.png")
     print(m.output()[mark:])
     print("--- desktop OK, screenshots in %s ---" % shots)
-    disk_test(kernel, initrd)
+    disk_test(kernel, initrd, 16, gui=True)
+    disk_test(kernel, initrd, 12)
+    disk_test(kernel, initrd, 32, mbr=True)
+    disk_full_test(kernel, initrd)
     print("\nPASS")
 
 

@@ -142,6 +142,7 @@ static int cmd_ls(int argc, char **argv)
     struct fs_node *n = fs_lookup(path);
     if (!n) { kprintf("ls: %s: not found\n", path); return 1; }
     if (!n->is_dir) { kprintf("%8u  %s\n", n->size, n->name); return 0; }
+    if (fs_open(n)) { kprintf("ls: %s: read error\n", path); return 1; }
     for (n = n->children; n; n = n->next) {
         if (n->is_dir) kprintf("   <dir>  %s/\n", n->name);
         else kprintf("%8u  %s\n", n->size, n->name);
@@ -155,6 +156,7 @@ static int cmd_cat(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         struct fs_node *n = fs_lookup(argv[i]);
         if (!n || n->is_dir) { kprintf("cat: %s: no such file\n", argv[i]); return 1; }
+        if (fs_open(n)) { kprintf("cat: %s: read error\n", argv[i]); return 1; }
         for (u32 k = 0; k < n->size; k++) kputc((char)n->data[k]);
     }
     return 0;
@@ -187,7 +189,7 @@ static int copy_file(const char *from, const char *to)
 {
     char path[VX_PATH_MAX];
     struct fs_node *src = fs_lookup(from), *dst = fs_lookup(to);
-    if (!src || src->is_dir) { kprintf("%s: no such file\n", from); return 1; }
+    if (!src || src->is_dir || fs_open(src)) { kprintf("%s: no such file\n", from); return 1; }
     if (dst == src) { kputs("source and destination are the same file\n"); return 1; }
     if (dst && dst->is_dir) {           /* copy into a directory */
         fs_abspath(dst, path, sizeof(path));
@@ -314,20 +316,22 @@ static int cmd_sync(int argc, char **argv)
     (void)argc; (void)argv;
     int r = fat_sync();
     if (r == -1) kputs("sync: no disk, or write error\n");
+    if (r == -2) kputs("sync: no space left on /disk\n");
     return r;
 }
 
 static int cmd_disk(int argc, char **argv)
 {
-    u32 total, used, syncs;
-    int pending;
+    struct fat_info i;
     (void)argc; (void)argv;
-    fat_info(&total, &used, &syncs, &pending);
-    if (!total) { kputs("No FAT16 disk. Files live in RAM and are lost on reboot.\n"); return 1; }
-    kprintf("ATA disk: %u KiB, FAT16 volume mounted at /disk\n", ata_sectors() / 2);
-    kprintf("Space: %u KiB total, %u KiB used\n", total, used);
-    kprintf("Writes: %u sync(s), %s\n", syncs, pending == 2 ? "DISK FULL, changes not saved"
-            : pending ? "changes waiting to be written" : "everything is saved");
+    fat_info(&i);
+    if (!i.type) { kputs("No FAT disk. Files live in RAM and are lost on reboot.\n"); return 1; }
+    kprintf("ATA disk: %u KiB", ata_sectors() / 2);
+    if (i.partition_lba) kprintf(", partition at sector %u", i.partition_lba);
+    kprintf("\nVolume: FAT%d, %u-byte clusters, mounted at /disk\n", i.type, i.cluster_bytes);
+    kprintf("Space: %u KiB total, %u KiB free\n", i.total_kb, i.free_kb);
+    kprintf("Writes: %u sync(s), %s\n", i.syncs, i.pending == 2 ? "DISK FULL, some changes not saved"
+            : i.pending ? "changes waiting to be written" : "everything is saved");
     return 0;
 }
 
@@ -444,6 +448,7 @@ static int run_script(struct fs_node *n, int argc, char **argv, int depth)
 
     struct task *t = task_current();
     struct sh_args args = { argc, argv };
+    if (fs_open(n)) { kputs("sh: read error\n"); return 1; }
     char *text = task_alloc(t, n->size + 1);        /* the file may change while we run */
     if (!text) { kputs("sh: out of memory\n"); return 1; }
     memcpy(text, n->data, n->size);

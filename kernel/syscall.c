@@ -5,7 +5,7 @@
 static int sys_fs_read(const char *path, u8 *buf, u32 max, u32 offset)
 {
     struct fs_node *n = fs_lookup(path);
-    if (!n || n->is_dir) return -1;
+    if (!n || n->is_dir || fs_open(n)) return -1;
     if (offset >= n->size) return 0;
     if (max > n->size - offset) max = n->size - offset;
     memcpy(buf, n->data + offset, max);
@@ -24,7 +24,7 @@ static int sys_fs_stat(const char *path, struct vx_stat *st)
 static int sys_fs_readdir(const char *path, int index, char *name)
 {
     struct fs_node *n = fs_lookup(path);
-    if (!n || !n->is_dir || index < 0) return -1;
+    if (!n || !n->is_dir || index < 0 || fs_open(n)) return -1;
     for (n = n->children; n && index; n = n->next) index--;
     if (!n) return 0;
     strcpy(name, n->name);

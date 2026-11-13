@@ -86,8 +86,10 @@ void kmain(u32 magic, const struct multiboot_info *mbi)
     int files = initrd ? fs_load_tar(initrd, initrd_len) : 0;
     kprintf("[ %s ] Root filesystem: %d file(s) from initrd\n", files ? "OK" : "--", files);
     u32 disk_kb = fat_mount();
-    if (disk_kb) kprintf("[ OK ] Disk: FAT16 volume, %u KiB, mounted at /disk\n", disk_kb);
-    else status(0, "No FAT16 disk (changes are kept in RAM only)");
+    struct fat_info fi;
+    fat_info(&fi);
+    if (disk_kb) kprintf("[ OK ] Disk: FAT%d volume, %u KiB, mounted at /disk\n", fi.type, disk_kb);
+    else status(0, "No FAT disk (changes are kept in RAM only)");
     status(gfx_available(), gfx_available() ? "Graphics adapter (Bochs VBE)"
                                             : "No graphics adapter: text mode only");
 

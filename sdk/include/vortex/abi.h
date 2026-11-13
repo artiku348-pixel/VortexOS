@@ -55,7 +55,7 @@ struct vx_stat {
     int is_dir;
 };
 
-#define VX_NAME_MAX 32
+#define VX_NAME_MAX 64
 #define VX_PATH_MAX 128
 #define VX_FONT_W 8
 #define VX_FONT_H 16

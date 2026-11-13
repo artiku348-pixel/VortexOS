@@ -225,7 +225,16 @@ struct fs_node {
     u8  *data;
     u32  size, cap;
     struct fs_node *parent, *children, *next;
+    /* nodes on the FAT volume (see fat.c) */
+    u32  fat_cluster;                   /* first cluster of the file / directory */
+    u32  fat_lba;                       /* sector holding the directory entry ... */
+    u16  fat_off;                       /* ... and its offset in that sector */
+    u8   fat_lfn;                       /* long-name entries in front of it */
+    u8   fat_flags;                     /* FAT_* */
 };
+#define FAT_ON_DISK 1                   /* the node lives on the FAT volume */
+#define FAT_LOADED  2                   /* children / file data are in memory */
+#define FAT_DIRTY   4                   /* file data must be written to the disk */
 void fs_init(void);
 
 /* ---- ata.c / fat.c (FAT16 disk mounted at /disk) ----------------------- */
@@ -235,15 +244,25 @@ int  ata_read(u32 lba, void *buf);              /* one 512-byte sector */
 int  ata_write(u32 lba, const void *buf);
 int  ata_flush(void);
 u32  fat_mount(void);                           /* volume size in KiB, 0 = none */
-int  fat_sync(void);
-void fat_changed(const struct fs_node *n);
+int  fat_sync(void);                            /* 0, -1 I/O error, -2 disk full */
+int  fat_load(struct fs_node *n);               /* read children / file data */
+int  fat_create(struct fs_node *n);             /* new directory entry for n */
+int  fat_remove(struct fs_node *n);             /* delete entry, free clusters */
+void fat_dirty(struct fs_node *n);              /* file data changed */
 int  fat_is_mount(const struct fs_node *n);
-void fat_info(u32 *total_kb, u32 *used_kb, u32 *syncs, int *pending);
+struct fat_info {
+    int type;                                   /* 12, 16, 32; 0 = not mounted */
+    u32 total_kb, free_kb, cluster_bytes, partition_lba, syncs;
+    int pending;                                /* 0 saved, 1 waiting, 2 disk full */
+};
+void fat_info(struct fat_info *info);
 int  fs_load_tar(const u8 *tar, u32 len);       /* returns number of files */
 struct fs_node *fs_lookup(const char *path);    /* relative to the task's cwd */
 struct fs_node *fs_create(const char *path, int is_dir);
 int  fs_write(struct fs_node *n, const void *data, u32 len, int append);
 int  fs_remove(const char *path);
+int  fs_open(struct fs_node *n);                /* make children / data available; 0 = ok */
+struct fs_node *fs_node_new(struct fs_node *parent, const char *name, int is_dir);
 void fs_abspath(const struct fs_node *n, char *buf, size_t max);
 
 /* ---- env.c ------------------------------------------------------------- */
@@ -254,7 +273,7 @@ int  env_at(int index, const char **name, const char **value);
 
 /* ---- exec.c / syscall.c ------------------------------------------------ */
 struct fs_node *exec_find(const char *name);    /* searches $PATH */
-int  exec_is_elf(const struct fs_node *n);
+int  exec_is_elf(struct fs_node *n);
 int  exec_spawn(struct fs_node *n, int argc, char **argv);  /* task id or -1 */
 void syscall_dispatch(struct regs *r);
 
